@@ -1,9 +1,12 @@
 use std::cell::RefCell;
 use std::io::Cursor;
 
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use lopdf::Document;
 use magnus::prelude::*;
-use magnus::{function, method, Error, RHash, RModule, RString, Symbol};
+use magnus::value::ReprValue;
+use magnus::{function, method, Error, RHash, RModule, RString, Symbol, Value};
+
+use crate::geometry::get_page_dimensions;
 
 /// Ruby wrapper around a `lopdf::Document`.
 ///
@@ -109,6 +112,59 @@ impl RbDocument {
         })?;
         Ok(RString::from_slice(&buf.into_inner()))
     }
+
+    /// `doc.stamp_metadata(reader:, ip:, timestamp:, unique_id:)` — set /Info dict entries.
+    ///
+    /// Writes 4 custom fields (Reader, ReadTimestamp, UniqueID, ReaderIP) to the
+    /// PDF's /Info dictionary. Creates the dictionary if it doesn't exist.
+    fn stamp_metadata(
+        &self,
+        reader: String,
+        ip: String,
+        timestamp: String,
+        unique_id: String,
+    ) -> Result<(), Error> {
+        crate::metadata::set_metadata(
+            &mut self.inner.borrow_mut(),
+            &reader,
+            &timestamp,
+            &unique_id,
+            &ip,
+        );
+        Ok(())
+    }
+
+    /// `doc.add_dlp_annotation(dlp_json)` — add a hidden FreeText annotation on the last page.
+    ///
+    /// The annotation is invisible (Hidden + NoView flags) and contains the
+    /// provided string as its /Contents. Typically a JSON blob with reader/document metadata.
+    fn add_dlp_annotation(&self, dlp_data: String) -> Result<(), Error> {
+        crate::annotation::add_invisible_annotation(
+            &mut self.inner.borrow_mut(),
+            &dlp_data,
+        ).map_err(|e| Error::new(magnus::exception::runtime_error(), e))
+    }
+
+    /// `doc.apply_visible_stamps(config_hash)` — render stamps on every page.
+    ///
+    /// Takes a Ruby Hash with keys :stamps, :text_blocks, :lines, :rectangles.
+    /// Converts to JSON via `to_json`, then deserializes into StampConfig to
+    /// preserve all serde defaults. The JSON round-trip overhead (~microseconds)
+    /// is negligible vs PDF processing.
+    fn apply_visible_stamps(&self, config: Value) -> Result<(), Error> {
+        let json_str: String = config.funcall("to_json", ())?;
+
+        let stamp_config: crate::stamp::StampConfig =
+            serde_json::from_str(&json_str).map_err(|e| {
+                Error::new(
+                    magnus::exception::arg_error(),
+                    format!("Invalid stamp config: {}", e),
+                )
+            })?;
+
+        crate::stamp::apply_stamp_config(&mut self.inner.borrow_mut(), &stamp_config);
+        Ok(())
+    }
 }
 
 /// Register the `Document` class under the `LopdfRb` module.
@@ -121,97 +177,18 @@ pub fn init(module: RModule) -> Result<(), Error> {
     class.define_method("page_dimensions", method!(RbDocument::page_dimensions, 1))?;
     class.define_method("save", method!(RbDocument::save, 1))?;
     class.define_method("to_bytes", method!(RbDocument::to_bytes, 0))?;
+    class.define_method("stamp_metadata", method!(RbDocument::stamp_metadata, 4))?;
+    class.define_method("add_dlp_annotation", method!(RbDocument::add_dlp_annotation, 1))?;
+    class.define_method("apply_visible_stamps", method!(RbDocument::apply_visible_stamps, 1))?;
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Geometry helpers — ported from rust/src/geometry.rs (lines 1-77).
-//
-// Only the 4 functions needed for page_dimensions are included here.
-// The full geometry module (including resolve_x, resolve_y) will replace
-// these helpers when it moves into the gem in AMPHTT-821.
-// ---------------------------------------------------------------------------
-
-/// Read page dimensions from MediaBox (or CropBox fallback).
-/// Returns (width, height) in PDF points.
-///
-/// Resolves inherited attributes by walking the /Parent chain (ISO 32000 §7.7.3.4).
-/// MediaBox is searched first across the entire chain; CropBox is only used as a
-/// fallback if no MediaBox is found anywhere. Capped at 32 levels to guard against
-/// circular references in malformed PDFs.
-fn get_page_dimensions(doc: &Document, page_id: ObjectId) -> (f64, f64) {
-    if let Some(dims) = find_inherited_bbox(doc, page_id, b"MediaBox") {
-        return dims;
-    }
-    if let Some(dims) = find_inherited_bbox(doc, page_id, b"CropBox") {
-        return dims;
-    }
-    // Fallback to US Letter
-    (612.0, 792.0)
-}
-
-/// Walk the /Parent chain looking for a specific bbox key (e.g. MediaBox, CropBox).
-fn find_inherited_bbox(doc: &Document, page_id: ObjectId, key: &[u8]) -> Option<(f64, f64)> {
-    let mut current_id = page_id;
-    for _ in 0..32 {
-        if let Ok(Object::Dictionary(ref dict)) = doc.get_object(current_id) {
-            if let Some(dims) = extract_bbox(doc, dict, key) {
-                return Some(dims);
-            }
-            if let Ok(Object::Reference(parent_id)) = dict.get(b"Parent") {
-                current_id = *parent_id;
-            } else {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    None
-}
-
-/// Try to extract a bounding box from a dictionary for the given key.
-/// Returns (width, height) if a valid 4-element bbox array is found.
-fn extract_bbox(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<(f64, f64)> {
-    if let Ok(val) = dict.get(key) {
-        let bbox = match val {
-            Object::Array(ref a) => Some(a),
-            Object::Reference(ref_id) => {
-                if let Ok(Object::Array(ref a)) = doc.get_object(*ref_id) {
-                    Some(a)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-        if let Some(bbox) = bbox {
-            if bbox.len() == 4 {
-                let x1 = obj_to_f64(&bbox[0]);
-                let y1 = obj_to_f64(&bbox[1]);
-                let x2 = obj_to_f64(&bbox[2]);
-                let y2 = obj_to_f64(&bbox[3]);
-                return Some(((x2 - x1).abs(), (y2 - y1).abs()));
-            }
-        }
-    }
-    None
-}
-
-/// Convert a PDF Object (Integer or Real) to f64.
-fn obj_to_f64(obj: &Object) -> f64 {
-    match obj {
-        Object::Integer(i) => *i as f64,
-        Object::Real(f) => (*f).into(),
-        _ => 0.0,
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lopdf::{Object, ObjectId, Stream};
+    use crate::geometry::obj_to_f64;
+    use lopdf::{Dictionary, Object, ObjectId, Stream};
 
     /// Build a minimal PDF document programmatically for testing.
     /// If `media_box` is Some, sets /MediaBox on the page dict.

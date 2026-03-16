@@ -5,6 +5,7 @@
 #
 # The native extension is a Rust cdylib built via rb_sys and magnus.
 
+require "json"
 require_relative "lopdf_rb/version"
 
 # Load the compiled Rust native extension. rb_sys places the .so under a

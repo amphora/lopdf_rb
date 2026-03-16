@@ -9,7 +9,12 @@
 //! The crate uses `magnus`/`rb-sys` for Ruby-Rust FFI and wraps the `lopdf`
 //! crate for all PDF operations.
 
+mod annotation;
 mod document;
+mod geometry;
+mod metadata;
+mod metrics;
+mod stamp;
 
 use magnus::{define_module, Error};
 
