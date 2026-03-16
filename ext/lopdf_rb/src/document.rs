@@ -4,7 +4,7 @@ use std::io::Cursor;
 use lopdf::Document;
 use magnus::prelude::*;
 use magnus::value::ReprValue;
-use magnus::{function, method, Error, RHash, RModule, RString, Symbol, Value};
+use magnus::{function, method, Error, RArray, RHash, RModule, RString, Symbol, Value};
 
 use crate::geometry::get_page_dimensions;
 
@@ -165,6 +165,76 @@ impl RbDocument {
         crate::stamp::apply_stamp_config(&mut self.inner.borrow_mut(), &stamp_config);
         Ok(())
     }
+
+    /// `doc.rotate_all_pages(angle)` — rotate all pages by the given angle.
+    ///
+    /// Angle must be 0, 90, 180, or 270 (clockwise). Cumulative with any
+    /// existing `/Rotate` value on each page.
+    fn rotate_all_pages(&self, angle: i64) -> Result<(), Error> {
+        crate::manipulation::rotate_all_pages(&mut self.inner.borrow_mut(), angle)
+            .map_err(|e| Error::new(magnus::exception::arg_error(), e))
+    }
+
+    /// `doc.split_pages` — split into individual single-page documents.
+    ///
+    /// Returns a Ruby Array of `LopdfRb::Document` instances, one per page.
+    fn split_pages(&self) -> Result<RArray, Error> {
+        let docs = crate::manipulation::split_pages(&self.inner.borrow())
+            .map_err(|e| Error::new(magnus::exception::runtime_error(), e))?;
+
+        let array = RArray::new();
+        for doc in docs {
+            array.push(RbDocument {
+                inner: RefCell::new(doc),
+            })?;
+        }
+        Ok(array)
+    }
+
+    /// `doc.duplicate` — deep-copy this document.
+    ///
+    /// Returns a new independent `LopdfRb::Document` via serialize round-trip.
+    fn duplicate(&self) -> Result<Self, Error> {
+        let doc = crate::manipulation::duplicate_document(&mut self.inner.borrow_mut())
+            .map_err(|e| Error::new(magnus::exception::runtime_error(), e))?;
+        Ok(RbDocument {
+            inner: RefCell::new(doc),
+        })
+    }
+
+    /// `LopdfRb::Document.merge(docs)` — merge multiple documents into one.
+    ///
+    /// Takes a Ruby Array of `LopdfRb::Document` instances. Returns a new
+    /// merged document with all pages in order.
+    ///
+    /// Uses manual iteration with `TryConvert` because `Obj<T>` does not
+    /// implement `TryConvertOwned` (required by `RArray::to_vec`).
+    fn merge(docs: RArray) -> Result<Self, Error> {
+        let len = docs.len();
+        let mut typed: Vec<magnus::typed_data::Obj<RbDocument>> = Vec::with_capacity(len);
+
+        for i in 0..len {
+            let val: Value = docs.entry(i as isize)?;
+            let obj = <magnus::typed_data::Obj<RbDocument> as magnus::TryConvert>::try_convert(val)
+                .map_err(|_| {
+                    Error::new(
+                        magnus::exception::arg_error(),
+                        format!("Element {} is not a LopdfRb::Document", i),
+                    )
+                })?;
+            typed.push(obj);
+        }
+
+        // Borrow all RefCells — safe under GVL (no concurrent mutation)
+        let borrows: Vec<_> = typed.iter().map(|obj| obj.inner.borrow()).collect();
+        let refs: Vec<&Document> = borrows.iter().map(|b| &**b).collect();
+
+        let merged = crate::manipulation::merge_documents(&refs)
+            .map_err(|e| Error::new(magnus::exception::runtime_error(), e))?;
+        Ok(RbDocument {
+            inner: RefCell::new(merged),
+        })
+    }
 }
 
 /// Register the `Document` class under the `LopdfRb` module.
@@ -173,6 +243,7 @@ pub fn init(module: RModule) -> Result<(), Error> {
 
     class.define_singleton_method("load", function!(RbDocument::load, 1))?;
     class.define_singleton_method("from_bytes", function!(RbDocument::from_bytes, 1))?;
+    class.define_singleton_method("merge", function!(RbDocument::merge, 1))?;
     class.define_method("page_count", method!(RbDocument::page_count, 0))?;
     class.define_method("page_dimensions", method!(RbDocument::page_dimensions, 1))?;
     class.define_method("save", method!(RbDocument::save, 1))?;
@@ -180,6 +251,9 @@ pub fn init(module: RModule) -> Result<(), Error> {
     class.define_method("stamp_metadata", method!(RbDocument::stamp_metadata, 4))?;
     class.define_method("add_dlp_annotation", method!(RbDocument::add_dlp_annotation, 1))?;
     class.define_method("apply_visible_stamps", method!(RbDocument::apply_visible_stamps, 1))?;
+    class.define_method("rotate_all_pages", method!(RbDocument::rotate_all_pages, 1))?;
+    class.define_method("split_pages", method!(RbDocument::split_pages, 0))?;
+    class.define_method("duplicate", method!(RbDocument::duplicate, 0))?;
 
     Ok(())
 }
