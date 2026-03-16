@@ -107,43 +107,19 @@ pub(crate) fn merge_documents(docs: &[&Document]) -> Result<Document, String> {
         let pages: BTreeMap<u32, ObjectId> = clone.get_pages();
         let page_ids: Vec<ObjectId> = pages.values().copied().collect();
 
-        // Get the catalog's Pages reference to skip it
-        let pages_root_id = clone
-            .trailer
-            .get(b"Root")
-            .ok()
-            .and_then(|root| {
-                if let Object::Reference(root_id) = root {
-                    clone.get_object(*root_id).ok()
-                } else {
-                    None
-                }
-            })
-            .and_then(|catalog| {
-                if let Object::Dictionary(ref cat_dict) = catalog {
-                    cat_dict.get(b"Pages").ok()
-                } else {
-                    None
-                }
-            })
-            .and_then(|pages_ref| {
-                if let Object::Reference(pages_id) = pages_ref {
-                    Some(*pages_id)
-                } else {
-                    None
-                }
-            });
-
         for (id, object) in clone.objects {
             if page_ids.contains(&id) {
-                // This is a page object — collect it separately
+                // Page object — collect separately for the new page tree
                 all_page_objects.push((id, object));
-            } else if Some(id) == pages_root_id {
-                // Skip the old /Pages root — we build a new one
-                continue;
             } else if let Object::Dictionary(ref dict) = object {
-                // Skip Catalog objects — we build a new one
-                if dict.get(b"Type").ok() == Some(&Object::Name(b"Catalog".to_vec())) {
+                // Skip Catalog and Pages nodes by /Type — we build new ones.
+                // This is more robust than looking up the Pages root by ID,
+                // and correctly handles multi-level page trees by flattening
+                // all intermediate /Pages nodes.
+                let obj_type = dict.get(b"Type").ok();
+                if obj_type == Some(&Object::Name(b"Catalog".to_vec()))
+                    || obj_type == Some(&Object::Name(b"Pages".to_vec()))
+                {
                     continue;
                 }
                 all_other_objects.push((id, object));
@@ -158,17 +134,33 @@ pub(crate) fn merge_documents(docs: &[&Document]) -> Result<Document, String> {
         merged.objects.insert(id, object);
     }
 
-    // Build the new /Pages tree
-    let pages_root_id = merged.new_object_id();
+    // Insert page objects
     let mut kids: Vec<Object> = Vec::new();
-
-    for (page_id, mut page_obj) in all_page_objects {
-        // Update each page's /Parent to point to our new Pages root
-        if let Object::Dictionary(ref mut page_dict) = page_obj {
-            page_dict.set("Parent", Object::Reference(pages_root_id));
-        }
+    for (page_id, page_obj) in all_page_objects {
         kids.push(Object::Reference(page_id));
         merged.objects.insert(page_id, page_obj);
+    }
+
+    // Update max_id AFTER inserting all objects (other + pages) so that
+    // new_object_id() won't collide. Page objects can have higher IDs
+    // than non-page objects from the same renumbered clone.
+    merged.max_id = merged
+        .objects
+        .keys()
+        .map(|&(id, _)| id)
+        .max()
+        .unwrap_or(0);
+
+    // Build the new /Pages tree
+    let pages_root_id = merged.new_object_id();
+
+    // Update each page's /Parent to point to the new Pages root
+    for kid in &kids {
+        if let Object::Reference(page_id) = kid {
+            if let Ok(Object::Dictionary(ref mut page_dict)) = merged.get_object_mut(*page_id) {
+                page_dict.set("Parent", Object::Reference(pages_root_id));
+            }
+        }
     }
 
     let mut pages_dict = Dictionary::new();
@@ -525,6 +517,23 @@ mod tests {
                 "Duplicate should not have /Rotate"
             );
         }
+    }
+
+    #[test]
+    fn test_merge_split_round_trip() {
+        // Split a real multi-page PDF then merge it back — page count must be preserved.
+        // This caught a bug where merged.max_id wasn't updated before new_object_id(),
+        // causing the Pages root to overwrite an existing object.
+        let doc = Document::load("/workspaces/patentsafe-ai/storage/repository/2022/11/07/AMPH2700000440/submitted.pdf").unwrap();
+        let page_count = doc.get_pages().len();
+        assert!(page_count >= 2, "Test needs a multi-page PDF");
+
+        let splits = split_pages(&doc).unwrap();
+        assert_eq!(splits.len(), page_count);
+
+        let refs: Vec<&Document> = splits.iter().collect();
+        let merged = merge_documents(&refs).unwrap();
+        assert_eq!(merged.get_pages().len(), page_count);
     }
 
     #[test]
