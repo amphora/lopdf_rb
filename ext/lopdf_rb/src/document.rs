@@ -111,6 +111,38 @@ impl RbDocument {
         })?;
         Ok(RString::from_slice(&buf.into_inner()))
     }
+
+    /// `doc.stamp_metadata(reader:, ip:, timestamp:, unique_id:)` — set /Info dict entries.
+    ///
+    /// Writes 4 custom fields (Reader, ReadTimestamp, UniqueID, ReaderIP) to the
+    /// PDF's /Info dictionary. Creates the dictionary if it doesn't exist.
+    fn stamp_metadata(
+        &self,
+        reader: String,
+        ip: String,
+        timestamp: String,
+        unique_id: String,
+    ) -> Result<(), Error> {
+        crate::metadata::set_metadata(
+            &mut self.inner.borrow_mut(),
+            &reader,
+            &timestamp,
+            &unique_id,
+            &ip,
+        );
+        Ok(())
+    }
+
+    /// `doc.add_dlp_annotation(dlp_json)` — add a hidden FreeText annotation on the last page.
+    ///
+    /// The annotation is invisible (Hidden + NoView flags) and contains the
+    /// provided string as its /Contents. Typically a JSON blob with reader/document metadata.
+    fn add_dlp_annotation(&self, dlp_data: String) -> Result<(), Error> {
+        crate::annotation::add_invisible_annotation(
+            &mut self.inner.borrow_mut(),
+            &dlp_data,
+        ).map_err(|e| Error::new(magnus::exception::runtime_error(), e))
+    }
 }
 
 /// Register the `Document` class under the `LopdfRb` module.
@@ -123,6 +155,8 @@ pub fn init(module: RModule) -> Result<(), Error> {
     class.define_method("page_dimensions", method!(RbDocument::page_dimensions, 1))?;
     class.define_method("save", method!(RbDocument::save, 1))?;
     class.define_method("to_bytes", method!(RbDocument::to_bytes, 0))?;
+    class.define_method("stamp_metadata", method!(RbDocument::stamp_metadata, 4))?;
+    class.define_method("add_dlp_annotation", method!(RbDocument::add_dlp_annotation, 1))?;
 
     Ok(())
 }
