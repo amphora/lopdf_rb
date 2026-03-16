@@ -46,6 +46,81 @@ Returns a frozen hash `{ width: Float, height: Float }` with the page dimensions
 
 Resolves inherited `/MediaBox` and `/CropBox` attributes by walking the page tree per ISO 32000 §7.7.3.4. Falls back to US Letter (612 × 792 points) if no bounding box is found.
 
+### `#stamp_metadata(reader, ip, timestamp, unique_id)` → `nil`
+
+Write custom fields to the PDF's `/Info` dictionary:
+
+- `Reader` — the reader's display name
+- `ReaderIP` — the reader's IP address
+- `ReadTimestamp` — ISO 8601 timestamp of the read event
+- `UniqueID` — UUID for this specific read event
+
+Creates the `/Info` dictionary if it doesn't exist. Preserves existing entries.
+
+```ruby
+doc.stamp_metadata(
+  "Alex Researcher",
+  "10.0.0.1",
+  Time.now.utc.iso8601(3),
+  SecureRandom.uuid
+)
+```
+
+### `#add_dlp_annotation(dlp_data)` → `nil`
+
+Add a hidden FreeText annotation to the **last page** of the document. The annotation is invisible (Hidden + NoView flags, F=34) and contains the provided string as its `/Contents`.
+
+Typically used to embed a JSON blob with reader/document metadata for DLP (Data Loss Prevention) purposes.
+
+```ruby
+doc.add_dlp_annotation('{"reader":"Alex","documentId":"DOC-123","timestamp":"2026-03-16T11:00:00.000Z"}')
+```
+
+Raises `RuntimeError` if the PDF has no pages.
+
+### `#apply_visible_stamps(config)` → `nil`
+
+Render visible stamps, text blocks, lines, and rectangles on **every page** of the document.
+
+Takes a Hash (converted to JSON internally) with four optional arrays:
+
+```ruby
+doc.apply_visible_stamps({
+  stamps: [{
+    text: "viewed by Alex",
+    x: 4, y: 8,
+    origin_x: "left",     # "left" | "right" | "centre"
+    origin_y: "top",      # "top" | "bottom" | "middle"
+    size: 8,
+    color: [0.5, 0.5, 0.5],  # RGB 0.0-1.0
+    font: "Helvetica",        # optional, defaults to Helvetica
+    align: "left",            # optional: "left" | "centre" | "right"
+    vertical_align: "bottom", # optional: "bottom" | "top" | "middle"
+    rotation: nil             # optional: degrees counter-clockwise
+  }],
+  text_blocks: [{
+    text: "Long text that wraps...",
+    x: 10, y: 700,
+    width: 200,           # max width in points before wrapping
+    line_spacing: 14,     # vertical spacing between lines
+    size: 12,             # optional, defaults to 12
+    color: [0, 0, 0]      # optional, defaults to black
+  }],
+  lines: [{
+    x1: 0, y1: 780, x2: 612, y2: 780,
+    color: [0, 0, 0],     # optional, defaults to black
+    thickness: 0.5        # optional, defaults to 0.5
+  }],
+  rectangles: [{
+    x1: 5, y1: 5, x2: 607, y2: 787,
+    color: [0.8, 0.8, 0.8], # optional
+    thickness: 1.0           # optional
+  }]
+})
+```
+
+Raises `ArgumentError` if the config hash cannot be deserialized.
+
 ### `#save(path)` → `nil`
 
 Save the document to a file. Raises `RuntimeError` on I/O failure.
