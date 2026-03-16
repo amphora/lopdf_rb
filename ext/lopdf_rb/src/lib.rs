@@ -10,6 +10,8 @@
 //! crate for all PDF operations.
 
 mod document;
+mod geometry;
+mod metrics;
 
 use magnus::{define_module, Error};
 
