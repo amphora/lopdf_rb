@@ -12,6 +12,7 @@
 mod annotation;
 mod document;
 mod geometry;
+mod manipulation;
 mod metadata;
 mod metrics;
 mod stamp;
