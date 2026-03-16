@@ -14,6 +14,7 @@ mod document;
 mod geometry;
 mod metadata;
 mod metrics;
+mod stamp;
 
 use magnus::{define_module, Error};
 

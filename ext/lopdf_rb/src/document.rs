@@ -3,7 +3,8 @@ use std::io::Cursor;
 
 use lopdf::Document;
 use magnus::prelude::*;
-use magnus::{function, method, Error, RHash, RModule, RString, Symbol};
+use magnus::value::ReprValue;
+use magnus::{function, method, Error, RHash, RModule, RString, Symbol, Value};
 
 use crate::geometry::get_page_dimensions;
 
@@ -143,6 +144,27 @@ impl RbDocument {
             &dlp_data,
         ).map_err(|e| Error::new(magnus::exception::runtime_error(), e))
     }
+
+    /// `doc.apply_visible_stamps(config_hash)` — render stamps on every page.
+    ///
+    /// Takes a Ruby Hash with keys :stamps, :text_blocks, :lines, :rectangles.
+    /// Converts to JSON via `to_json`, then deserializes into StampConfig to
+    /// preserve all serde defaults. The JSON round-trip overhead (~microseconds)
+    /// is negligible vs PDF processing.
+    fn apply_visible_stamps(&self, config: Value) -> Result<(), Error> {
+        let json_str: String = config.funcall("to_json", ())?;
+
+        let stamp_config: crate::stamp::StampConfig =
+            serde_json::from_str(&json_str).map_err(|e| {
+                Error::new(
+                    magnus::exception::arg_error(),
+                    format!("Invalid stamp config: {}", e),
+                )
+            })?;
+
+        crate::stamp::apply_stamp_config(&mut self.inner.borrow_mut(), &stamp_config);
+        Ok(())
+    }
 }
 
 /// Register the `Document` class under the `LopdfRb` module.
@@ -157,6 +179,7 @@ pub fn init(module: RModule) -> Result<(), Error> {
     class.define_method("to_bytes", method!(RbDocument::to_bytes, 0))?;
     class.define_method("stamp_metadata", method!(RbDocument::stamp_metadata, 4))?;
     class.define_method("add_dlp_annotation", method!(RbDocument::add_dlp_annotation, 1))?;
+    class.define_method("apply_visible_stamps", method!(RbDocument::apply_visible_stamps, 1))?;
 
     Ok(())
 }
