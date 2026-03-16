@@ -1,0 +1,21 @@
+[package]
+name = "lopdf_rb"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Ruby native extension wrapping the lopdf PDF library via magnus/rb-sys"
+authors = ["Amphora Research Systems <dev@amphora.net>"]
+license = "Proprietary"
+readme = "../../README.md"
+rust-version = "1.75"
+
+[lib]
+crate-type = ["cdylib"]
+
+# magnus and rb-sys pinned to same versions as tantivy_rb to avoid ABI
+# conflicts when both gems load in the same Ruby process.
+# lopdf pinned to match the pdf-stamp binary for identical behaviour.
+[dependencies]
+magnus = { version = "=0.7.1", features = ["rb-sys"] }
+rb-sys = "=0.9.124"
+lopdf = "=0.34"
