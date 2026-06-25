@@ -521,10 +521,22 @@ mod tests {
 
     #[test]
     fn test_merge_split_round_trip() {
-        // Split a real multi-page PDF then merge it back — page count must be preserved.
-        // This caught a bug where merged.max_id wasn't updated before new_object_id(),
-        // causing the Pages root to overwrite an existing object.
-        let doc = Document::load("/workspaces/patentsafe-ai/storage/repository/2022/11/07/AMPH2700000440/submitted.pdf").unwrap();
+        // Split a synthetic multi-page PDF then merge it back. The source is
+        // built in-process via `create_test_pdf` (no on-disk fixture) so the
+        // test runs anywhere, including the gem's CI.
+        //
+        // This guards a real object-ID collision bug in `merge_documents`. The
+        // buggy version never recomputed `merged.max_id` after inserting the
+        // renumbered objects, so it stayed at 0 and `new_object_id()` (plus the
+        // `add_object` for the catalog) returned ids that were already in use,
+        // silently overwriting an existing object. On the original fixture that
+        // clobbered object was a *page*, so page count dropped. With a synthetic
+        // doc the clobbered object is a content stream, so the page count is
+        // preserved but a page is left referencing a non-stream object — hence
+        // the content-integrity check below, which catches the collision even
+        // when `get_pages().len()` does not. Remove the `merged.max_id`
+        // recompute in `merge_documents` and that check fails.
+        let doc = create_test_pdf(3);
         let page_count = doc.get_pages().len();
         assert!(page_count >= 2, "Test needs a multi-page PDF");
 
@@ -534,6 +546,24 @@ mod tests {
         let refs: Vec<&Document> = splits.iter().collect();
         let merged = merge_documents(&refs).unwrap();
         assert_eq!(merged.get_pages().len(), page_count);
+
+        // Every merged page must still reference a real content stream. An
+        // object-ID collision overwrites a referenced object, leaving a page
+        // pointing at a non-stream (or nothing) — this is the invariant the
+        // original round-trip test existed to protect.
+        for (_page_num, page_id) in merged.get_pages() {
+            let stream_ids = merged.get_page_contents(page_id);
+            assert!(
+                !stream_ids.is_empty(),
+                "merged page {page_id:?} has no content stream — object-ID collision clobbered it"
+            );
+            for stream_id in stream_ids {
+                assert!(
+                    matches!(merged.get_object(stream_id), Ok(Object::Stream(_))),
+                    "merged page {page_id:?} /Contents -> {stream_id:?} is not a stream — object-ID collision"
+                );
+            }
+        }
     }
 
     #[test]
