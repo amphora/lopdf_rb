@@ -355,7 +355,7 @@ pub fn init(module: RModule) -> Result<(), Error> {
 mod tests {
     use super::*;
     use crate::geometry::obj_to_f64;
-    use lopdf::{Dictionary, Object, ObjectId, Stream};
+    use lopdf::{Dictionary, Object, ObjectId, Stream, StringFormat};
 
     /// Build a minimal PDF document programmatically for testing.
     /// If `media_box` is Some, sets /MediaBox on the page dict.
@@ -476,5 +476,208 @@ mod tests {
     fn test_obj_to_f64_unsupported() {
         assert!((obj_to_f64(&Object::Boolean(true))).abs() < f64::EPSILON);
         assert!((obj_to_f64(&Object::Null)).abs() < f64::EPSILON);
+    }
+
+    // ── RefCell borrow-choreography tests ───────────────────────────────
+    //
+    // The magnus wrapper methods (`stamp_metadata`, `rotate_all_pages`, …)
+    // cannot be invoked from a `#[cfg(test)]` binary — they build Ruby objects
+    // (`RHash`, `RString`, magnus `Error`) that need a live Ruby VM. So these
+    // tests reproduce each wrapper's exact `RefCell` borrow sequence against a
+    // real `lopdf::Document` and call the same `pub(crate)` delegate, asserting
+    // the post-condition the wrapper would produce. This exercises the borrow
+    // choreography (the subject of the single-borrow-at-a-time invariant) at
+    // the delegate level. The Ruby-layer gap is documented in the PR body.
+
+    /// Build an `n`-page PDF for the choreography tests. Distinct from the
+    /// dimension-focused `create_test_pdf` above: it takes a page count and
+    /// returns just the `Document` (each page a US-Letter empty content page),
+    /// mirroring the identically-shaped helpers in `annotation.rs` /
+    /// `manipulation.rs`.
+    fn build_pdf(page_count: usize) -> Document {
+        let mut doc = Document::new();
+        let pages_id = doc.new_object_id();
+
+        let mut kids = Vec::new();
+        for _ in 0..page_count {
+            let content_id = doc.add_object(Stream::new(Dictionary::new(), Vec::new()));
+
+            let mut page_dict = Dictionary::new();
+            page_dict.set("Type", Object::Name(b"Page".to_vec()));
+            page_dict.set("Parent", Object::Reference(pages_id));
+            page_dict.set("MediaBox", Object::Array(us_letter_box()));
+            page_dict.set("Contents", Object::Reference(content_id));
+            kids.push(Object::Reference(doc.add_object(page_dict)));
+        }
+
+        let mut pages_dict = Dictionary::new();
+        pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
+        pages_dict.set("Kids", Object::Array(kids));
+        pages_dict.set("Count", Object::Integer(page_count as i64));
+        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
+
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+        catalog.set("Pages", Object::Reference(pages_id));
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        doc
+    }
+
+    /// `stamp_metadata` → `borrow_mut()` → `metadata::set_metadata`.
+    #[test]
+    fn borrow_choreography_stamp_metadata() {
+        let cell = RefCell::new(build_pdf(1));
+        crate::metadata::set_metadata(
+            &mut cell.borrow_mut(),
+            "Alice",
+            "2026-07-01T00:00:00Z",
+            "UID-1",
+            "10.0.0.1",
+        );
+
+        let doc = cell.borrow();
+        let info_id = doc.trailer.get(b"Info").unwrap().as_reference().unwrap();
+        if let Ok(Object::Dictionary(ref info)) = doc.get_object(info_id) {
+            // Assert the value, not just key presence, so a transposed-argument
+            // regression (reader vs timestamp) would be caught.
+            assert_eq!(
+                info.get(b"Reader").unwrap(),
+                &Object::String(b"Alice".to_vec(), StringFormat::Literal)
+            );
+        } else {
+            panic!("/Info is not a dictionary");
+        }
+    }
+
+    /// `add_dlp_annotation` → `borrow_mut()` → `annotation::add_invisible_annotation`.
+    #[test]
+    fn borrow_choreography_add_dlp_annotation() {
+        let cell = RefCell::new(build_pdf(2));
+        crate::annotation::add_invisible_annotation(
+            &mut cell.borrow_mut(),
+            r#"{"reader":"Alice"}"#,
+        )
+        .unwrap();
+
+        let doc = cell.borrow();
+        let last_page_id = *doc.get_pages().values().last().unwrap();
+        if let Ok(Object::Dictionary(ref page)) = doc.get_object(last_page_id) {
+            assert!(
+                page.get(b"Annots").is_ok(),
+                "last page should gain an /Annots entry"
+            );
+        } else {
+            panic!("page is not a dictionary");
+        }
+    }
+
+    /// `apply_visible_stamps` → `borrow_mut()` → `stamp::apply_stamp_config`.
+    ///
+    /// Mirrors the delegate's borrow sequence only. The real wrapper also calls
+    /// `config.funcall("to_json", ())` (a Ruby re-entry) *before* it takes
+    /// `borrow_mut()`; that step needs a live Ruby VM and is not covered here. A
+    /// non-empty config is used deliberately so the post-condition proves the
+    /// delegate actually mutated the document — an empty config is a no-op and
+    /// would pass vacuously.
+    #[test]
+    fn borrow_choreography_apply_visible_stamps() {
+        let cell = RefCell::new(build_pdf(2));
+        // One rectangle → apply_stamp_config appends a content stream to each
+        // page, promoting its /Contents (a single Reference) to a 2-element
+        // Array [original, stamp].
+        let config: crate::stamp::StampConfig =
+            serde_json::from_str(r#"{"rectangles":[{"x1":10,"y1":10,"x2":100,"y2":100}]}"#)
+                .unwrap();
+        crate::stamp::apply_stamp_config(&mut cell.borrow_mut(), &config);
+
+        let doc = cell.borrow();
+        assert_eq!(doc.get_pages().len(), 2, "page count unchanged");
+        for (_num, page_id) in doc.get_pages() {
+            if let Ok(Object::Dictionary(ref page)) = doc.get_object(page_id) {
+                if let Ok(Object::Array(ref contents)) = page.get(b"Contents") {
+                    assert_eq!(contents.len(), 2, "original + appended stamp stream");
+                } else {
+                    panic!("/Contents should be an Array after stamping");
+                }
+            } else {
+                panic!("page is not a dictionary");
+            }
+        }
+    }
+
+    /// `rotate_all_pages` → `borrow_mut()` → `manipulation::rotate_all_pages`.
+    #[test]
+    fn borrow_choreography_rotate_all_pages() {
+        let cell = RefCell::new(build_pdf(3));
+        crate::manipulation::rotate_all_pages(&mut cell.borrow_mut(), 90).unwrap();
+
+        let doc = cell.borrow();
+        for (_num, page_id) in doc.get_pages() {
+            if let Ok(Object::Dictionary(ref page)) = doc.get_object(page_id) {
+                assert_eq!(page.get(b"Rotate").unwrap(), &Object::Integer(90));
+            } else {
+                panic!("page is not a dictionary");
+            }
+        }
+    }
+
+    /// `split_pages` → `borrow()` (immutable) → `manipulation::split_pages`.
+    #[test]
+    fn borrow_choreography_split_pages() {
+        let cell = RefCell::new(build_pdf(3));
+        let parts = crate::manipulation::split_pages(&cell.borrow()).unwrap();
+        assert_eq!(parts.len(), 3);
+        for part in &parts {
+            assert_eq!(part.get_pages().len(), 1);
+        }
+    }
+
+    /// `duplicate` → `borrow_mut()` → `manipulation::duplicate_document`.
+    #[test]
+    fn borrow_choreography_duplicate() {
+        let cell = RefCell::new(build_pdf(2));
+        let dup = crate::manipulation::duplicate_document(&mut cell.borrow_mut()).unwrap();
+        assert_eq!(dup.get_pages().len(), 2);
+        assert_eq!(cell.borrow().get_pages().len(), 2, "source is left intact");
+    }
+
+    /// `merge` → multiple immutable `borrow()`s → `manipulation::merge_documents`.
+    #[test]
+    fn borrow_choreography_merge() {
+        let a = RefCell::new(build_pdf(2));
+        let b = RefCell::new(build_pdf(3));
+        // Mirrors the wrapper: collect the borrows, then take `&Document` refs.
+        let ba = a.borrow();
+        let bb = b.borrow();
+        let merged = crate::manipulation::merge_documents(&[&*ba, &*bb]).unwrap();
+        assert_eq!(merged.get_pages().len(), 5);
+    }
+
+    /// The invariant's failure mode, pinned at the `RefCell` level. A future
+    /// wrapper composition that holds a `borrow_mut()` guard and then reaches a
+    /// path taking `borrow()` on the *same* cell (e.g. `borrow_mut()` then
+    /// `page_dimensions`, which takes `borrow()`) panics at run time;
+    /// `RefCell::borrow` reports `already mutably borrowed`. The wrapper methods
+    /// need a live Ruby VM, so this pins the mechanism on a bare cell.
+    #[test]
+    #[should_panic(expected = "already mutably borrowed")]
+    fn nested_borrow_panics() {
+        let cell = RefCell::new(build_pdf(1));
+        let _guard = cell.borrow_mut();
+        let _second = cell.borrow();
+    }
+
+    /// The complementary direction: a live shared `borrow()` guard, then a
+    /// `borrow_mut()` on the same cell. `RefCell::borrow_mut` reports
+    /// `already borrowed` — a distinct message from the case above, so both
+    /// directions are pinned rather than assumed symmetric.
+    #[test]
+    #[should_panic(expected = "already borrowed")]
+    fn nested_borrow_mut_panics() {
+        let cell = RefCell::new(build_pdf(1));
+        let _guard = cell.borrow();
+        let _second = cell.borrow_mut();
     }
 }
