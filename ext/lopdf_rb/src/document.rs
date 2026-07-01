@@ -10,9 +10,43 @@ use crate::geometry::get_page_dimensions;
 
 /// Ruby wrapper around a `lopdf::Document`.
 ///
-/// Uses `RefCell` for interior mutability because magnus exposes methods via
-/// `&self` (shared references), but several lopdf operations (save, serialize)
-/// require `&mut self`. Safe under Ruby's GVL — no concurrent access.
+/// # Interior mutability and the single-borrow-at-a-time invariant
+///
+/// `inner` is a `RefCell` because magnus exposes every method via `&self`
+/// (shared references), yet several methods need `&mut Document` for their
+/// underlying lopdf work: `save`, `to_bytes` (`save_to`), `stamp_metadata`,
+/// `add_dlp_annotation`, `apply_visible_stamps`, `rotate_all_pages`, and
+/// `duplicate`. `RefCell` moves the shared-vs-exclusive borrow check from
+/// compile time to run time so those `&mut` operations can be reached through a
+/// `&self` method.
+///
+/// **Invariant: for any one `RbDocument`, at most one borrow of its `inner` is
+/// live at a time.** Every method here takes a fresh `borrow()` / `borrow_mut()`
+/// on `self.inner`, does its work, and drops the guard before returning to Ruby.
+/// Two facts uphold this today:
+///
+///   1. Ruby's GVL serialises Ruby-thread execution, so no two Ruby threads are
+///      ever inside these methods at once — there is no concurrent access.
+///   2. No method holds a guard on a cell across a call that borrows that
+///      *same* cell.
+///
+/// (`merge` borrows several *different* documents' cells at once — one shared
+/// `borrow()` per input — which is fine: the invariant is per-cell, and those
+/// are distinct `RefCell`s.)
+///
+/// **Primary risk for future refactors.** `RefCell` enforces the invariant at
+/// *run time*, not compile time — so the compiler will not catch a violation.
+/// A Rust-level composition that holds a `borrow_mut()` guard on a cell while
+/// calling a method that borrows the *same* cell — e.g. taking `borrow_mut()`
+/// and, while it is still live, calling `page_dimensions` (which takes
+/// `borrow()`) — compiles cleanly but panics (`already mutably borrowed`) the
+/// first time that path executes, with no compile-time warning. When composing
+/// wrapper logic, drop the outer guard before the inner call, or factor the
+/// shared work into a helper taking `&mut Document` so both callers pass one
+/// borrow down rather than each taking their own. The `nested_borrow_panics` /
+/// `nested_borrow_mut_panics` tests pin this failure mode at the `RefCell`
+/// level (the wrapper methods need a live Ruby VM, so they are exercised via
+/// their delegates — see the borrow-choreography tests).
 #[magnus::wrap(class = "LopdfRb::Document")]
 pub struct RbDocument {
     inner: RefCell<Document>,
