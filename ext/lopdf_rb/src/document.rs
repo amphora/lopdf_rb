@@ -68,11 +68,70 @@ impl RbDocument {
 
     /// `LopdfRb::Document.from_bytes(bytes)` — load a PDF from a binary string.
     ///
-    /// Uses `unsafe { bytes.as_slice() }` to avoid copying the entire PDF into
-    /// a new allocation. This is safe because `Document::load_mem` copies the
-    /// data into its own structures before returning, so the slice is not held
-    /// beyond this call. Safe under the GVL.
+    /// Uses `unsafe { bytes.as_slice() }` to borrow the Ruby string's bytes in
+    /// place rather than copying the whole PDF into a fresh allocation first.
+    ///
+    /// # Soundness of the internal `unsafe` borrow
+    ///
+    /// (`from_bytes` is a *safe* fn — callers carry no obligation. This section
+    /// documents why the `unsafe` block below is sound; the `// SAFETY:` comment
+    /// on the block is the conventional pointer to it.)
+    ///
+    /// `RString::as_slice` is unsafe because the returned slice is only valid
+    /// while the backing Ruby string is neither freed nor relocated by Ruby's
+    /// GC. This call is sound because of three facts, each of which must hold:
+    ///
+    /// 1. **The slice stays valid for the whole `load_mem` call.** The calling
+    ///    Ruby thread holds the GVL for the entire method, and between
+    ///    `as_slice()` and `load_mem` returning it allocates no Ruby objects and
+    ///    never releases the GVL or re-enters Ruby. MRI's GC — mark-sweep *and*
+    ///    the compactor (`GC.compact` / `GC.auto_compact`, either of which an
+    ///    application may enable outside this gem's control) — only runs at a
+    ///    safe point: a Ruby allocation or a GVL release. Neither occurs in this
+    ///    window, so the RString cannot be freed or relocated regardless of
+    ///    whether auto-compaction is on. `bytes` is also a live method argument
+    ///    reachable from the Ruby stack, so it is uncollectable in any case.
+    ///    Note `load_mem` is *not* single-threaded: lopdf's default features
+    ///    include `rayon`, so its parser reads the slice from several native
+    ///    Rayon worker threads (`reader.rs` `par_iter`). That is sound — the
+    ///    workers are pure Rust, never touch the Ruby C API, `&[u8]` is `Sync`,
+    ///    and Rayon joins them before `load_mem` returns — but it means the
+    ///    guarantee is "the *calling* thread holds the GVL", not "nothing runs
+    ///    concurrently". Do not use this comment as licence to add heap
+    ///    allocations or GVL-releasing calls inside the borrow window.
+    ///
+    /// 2. **`load_mem` retains no reference to the slice.** It returns an owned
+    ///    `lopdf::Document` — a type with no lifetime parameter — whose parser
+    ///    copies every byte it keeps into owned `Vec<u8>`s (`Object::String`,
+    ///    `Object::Stream` content via `self.buffer[..].to_vec()`, …); lopdf's
+    ///    internal `Reader`, which borrows the slice, is dropped before
+    ///    `load_mem` returns. (The `Stream::start_position` that survives is a
+    ///    byte-offset integer, not a pointer into the input.) Verified against
+    ///    lopdf 0.34.0 (`reader.rs`: `Document::load_mem` → `<&[u8] as
+    ///    TryInto<Document>>`). lopdf 0.34.0 also declares
+    ///    `#![forbid(unsafe_code)]` (`lib.rs:2`), which makes internal
+    ///    raw-pointer retention *structurally impossible* in this version — not
+    ///    merely absent — so fact 2 rests on more than a one-time source read.
+    ///
+    /// 3. **The lopdf version is pinned.** Fact 2 is an internal lopdf
+    ///    implementation detail, not a stable API contract. A change making the
+    ///    returned document *borrow* the input would need a lifetime on
+    ///    `Document`/`load_mem` and so would break *this* call site at compile
+    ///    time — but a future lopdf that lifted `forbid(unsafe_code)` and
+    ///    retained the pointer via `unsafe`, or that began releasing the GVL /
+    ///    calling back into Ruby mid-parse, would be silent. The
+    ///    `lopdf = "=0.34"` pin in `Cargo.toml` (and the exact `Cargo.lock`
+    ///    version) is therefore a hard stability invariant: any lopdf bump must
+    ///    re-verify that `load_mem` still copies out into an owned `Document`,
+    ///    keeps `forbid(unsafe_code)`, and never releases the GVL, before the
+    ///    pin is moved.
     fn from_bytes(bytes: RString) -> Result<Self, Error> {
+        // SAFETY: see "Soundness of the internal `unsafe` borrow" above. The
+        // slice is read only while this `load_mem` call runs; the calling thread
+        // holds the GVL so MRI GC cannot free or compact the RString, any Rayon
+        // worker threads only read the slice and are joined before the call
+        // returns, and `load_mem` returns an owned Document that copies the
+        // bytes out and keeps no borrow into the slice.
         let slice = unsafe { bytes.as_slice() };
         let doc = Document::load_mem(slice).map_err(|e| {
             Error::new(
