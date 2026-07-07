@@ -16,15 +16,35 @@ pub(crate) fn set_metadata(doc: &mut Document, reader: &str, timestamp: &str, un
 
     match doc.get_object_mut(info_id) {
         Ok(Object::Dictionary(dict)) => {
-            dict.set("Reader", Object::String(reader.as_bytes().to_vec(), StringFormat::Literal));
-            dict.set("ReadTimestamp", Object::String(timestamp.as_bytes().to_vec(), StringFormat::Literal));
-            dict.set("UniqueID", Object::String(unique_id.as_bytes().to_vec(), StringFormat::Literal));
-            dict.set("ReaderIP", Object::String(ip.as_bytes().to_vec(), StringFormat::Literal));
+            dict.set("Reader", Object::String(encode_text_string(reader), StringFormat::Literal));
+            dict.set("ReadTimestamp", Object::String(encode_text_string(timestamp), StringFormat::Literal));
+            dict.set("UniqueID", Object::String(encode_text_string(unique_id), StringFormat::Literal));
+            dict.set("ReaderIP", Object::String(encode_text_string(ip), StringFormat::Literal));
             Ok(())
         }
         Ok(_) => Err(format!("/Info object {:?} is not a dictionary", info_id)),
         Err(e) => Err(format!("failed to resolve /Info object {:?}: {}", info_id, e)),
     }
+}
+
+/// Encode a UTF-8 string for storage as a PDF text string (ISO 32000 §7.9.2):
+/// ASCII passes through verbatim (ASCII is a subset of PDFDocEncoding);
+/// anything else becomes UTF-16BE prefixed with the \xFE\xFF BOM. Raw UTF-8
+/// bytes are not a valid text-string encoding and viewers mis-decode them.
+///
+/// The UTF-16BE bytes may contain 0x0D (e.g. "č" = U+010D), which an
+/// unescaped Literal string would corrupt to 0x0A on read; safe here because
+/// lopdf's writer (pinned =0.34) escapes `\r` in Literal strings.
+fn encode_text_string(s: &str) -> Vec<u8> {
+    if s.is_ascii() {
+        return s.as_bytes().to_vec();
+    }
+    let mut bytes = Vec::with_capacity(2 + s.len() * 2);
+    bytes.extend_from_slice(&[0xFE, 0xFF]);
+    for unit in s.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_be_bytes());
+    }
+    bytes
 }
 
 #[cfg(test)]
@@ -91,6 +111,47 @@ mod tests {
             assert_eq!(
                 dict.get(b"Reader").unwrap(),
                 &Object::String(b"Bob".to_vec(), StringFormat::Literal)
+            );
+        } else {
+            panic!("Info object should be a dictionary");
+        }
+    }
+
+    #[test]
+    fn test_encode_text_string_ascii_passthrough() {
+        assert_eq!(encode_text_string("Alex"), b"Alex".to_vec());
+    }
+
+    #[test]
+    fn test_encode_text_string_non_ascii_utf16be() {
+        assert_eq!(
+            encode_text_string("José"),
+            vec![0xFE, 0xFF, 0x00, 0x4A, 0x00, 0x6F, 0x00, 0x73, 0x00, 0xE9]
+        );
+        // "č" (U+010D): its UTF-16BE bytes contain 0x0D — the CR byte the
+        // Literal-string carrier depends on lopdf's writer escaping.
+        assert_eq!(encode_text_string("č"), vec![0xFE, 0xFF, 0x01, 0x0D]);
+    }
+
+    #[test]
+    fn test_set_metadata_encodes_non_ascii_reader_as_utf16be() {
+        let mut doc = create_empty_pdf();
+
+        set_metadata(&mut doc, "José", "2026-01-01T00:00:00.000Z", "uuid-123", "10.0.0.1").unwrap();
+
+        let info_ref = doc.trailer.get(b"Info").unwrap().as_reference().unwrap();
+        if let Ok(Object::Dictionary(ref dict)) = doc.get_object(info_ref) {
+            assert_eq!(
+                dict.get(b"Reader").unwrap(),
+                &Object::String(
+                    vec![0xFE, 0xFF, 0x00, 0x4A, 0x00, 0x6F, 0x00, 0x73, 0x00, 0xE9],
+                    StringFormat::Literal
+                )
+            );
+            // ASCII siblings in the same call stay verbatim
+            assert_eq!(
+                dict.get(b"ReaderIP").unwrap(),
+                &Object::String(b"10.0.0.1".to_vec(), StringFormat::Literal)
             );
         } else {
             panic!("Info object should be a dictionary");
