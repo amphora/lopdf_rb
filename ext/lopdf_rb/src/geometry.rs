@@ -69,11 +69,20 @@ fn extract_bbox(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<(f64, f
 }
 
 /// Convert a PDF Object (Integer or Real) to f64.
+/// Non-numeric objects (malformed bbox entries) convert to 0.0 with a stderr
+/// diagnostic — a zero coordinate silently misplaces stamps, so the condition
+/// must be observable in all build profiles.
 pub(crate) fn obj_to_f64(obj: &Object) -> f64 {
     match obj {
         Object::Integer(i) => *i as f64,
         Object::Real(f) => (*f).into(),
-        _ => 0.0,
+        _ => {
+            eprintln!(
+                "lopdf_rb: non-numeric object in bbox entry: {:?}; treating as 0.0",
+                obj
+            );
+            0.0
+        }
     }
 }
 
