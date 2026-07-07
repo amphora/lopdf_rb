@@ -5,14 +5,17 @@ use std::io::Write;
 /// fails (closed or broken pipe under a supervisor/log shipper); magnus
 /// converts a Rust panic into an unrescuable Ruby `fatal`, so a failed log
 /// line must never unwind — the write result is deliberately discarded.
-pub(crate) fn warn(msg: &str) {
+fn warn(msg: &str) {
     let _ = writeln!(std::io::stderr(), "lopdf_rb: {}", msg);
 }
 
-/// US Letter (width, height) in PDF points — the fallback callers apply when
-/// `get_page_dimensions` returns `None`. Deliberately not applied inside this
-/// module: each caller decides on the fallback and warns, so a boxless page
-/// stays distinguishable from a real US Letter page.
+/// US Letter (width, height) in PDF points — the fallback
+/// `get_page_dimensions_or_fallback` applies when no valid MediaBox/CropBox
+/// exists. Deliberately not applied inside `get_page_dimensions` itself: the
+/// `None` return keeps the boxless case explicit in the type, and the
+/// fallback path warns on stderr so the condition is observable in logs
+/// (the returned dimensions themselves are identical to a real US Letter
+/// page — there is no API-level marker).
 pub(crate) const US_LETTER_FALLBACK: (f64, f64) = (612.0, 792.0);
 
 /// Read page dimensions from MediaBox (or CropBox fallback).
@@ -29,6 +32,25 @@ pub(crate) const US_LETTER_FALLBACK: (f64, f64) = (612.0, 792.0);
 pub(crate) fn get_page_dimensions(doc: &Document, page_id: ObjectId) -> Option<(f64, f64)> {
     find_inherited_bbox(doc, page_id, b"MediaBox")
         .or_else(|| find_inherited_bbox(doc, page_id, b"CropBox"))
+}
+
+/// Page dimensions with the shared US Letter fallback applied: returns the
+/// real dimensions when a valid MediaBox/CropBox exists, otherwise warns on
+/// stderr — naming the 1-based physical page number — and returns
+/// `US_LETTER_FALLBACK`. All call sites go through here so the fallback
+/// value, warning text, and page-numbering convention stay in one place.
+pub(crate) fn get_page_dimensions_or_fallback(
+    doc: &Document,
+    page_id: ObjectId,
+    page_number: u32,
+) -> (f64, f64) {
+    get_page_dimensions(doc, page_id).unwrap_or_else(|| {
+        warn(&format!(
+            "page {} has no MediaBox/CropBox; falling back to US Letter ({}x{})",
+            page_number, US_LETTER_FALLBACK.0, US_LETTER_FALLBACK.1
+        ));
+        US_LETTER_FALLBACK
+    })
 }
 
 /// Walk the /Parent chain looking for a specific bbox key (e.g. MediaBox, CropBox).

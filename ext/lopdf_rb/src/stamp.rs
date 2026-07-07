@@ -1,7 +1,7 @@
 use lopdf::{Document, Object, ObjectId, Dictionary, Stream};
 use serde::Deserialize;
 
-use crate::geometry::{get_page_dimensions, resolve_x, resolve_y, US_LETTER_FALLBACK};
+use crate::geometry::{get_page_dimensions_or_fallback, resolve_x, resolve_y};
 use crate::metrics::text_width_pt;
 
 /// Stamp configuration read from the JSON file produced by Ruby.
@@ -120,12 +120,12 @@ fn default_thickness() -> f64 { 0.5 }
 /// resolves origin-relative coordinates, and appends a content stream
 /// with the stamp text.
 pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) {
-    let pages = doc.get_pages();
-    // Collect page IDs (sorted by page number) so we can mutate doc afterwards
-    let page_ids: Vec<ObjectId> = pages.iter()
-        .collect::<std::collections::BTreeMap<_, _>>()
-        .values()
-        .map(|id| **id)
+    // Collect (page number, page ID) pairs so we can mutate doc afterwards —
+    // get_pages() returns a BTreeMap, so iteration is already sorted by the
+    // 1-based physical page number.
+    let page_ids: Vec<(u32, ObjectId)> = doc.get_pages()
+        .iter()
+        .map(|(&number, &id)| (number, id))
         .collect();
 
     // If no pages, nothing to do
@@ -135,19 +135,10 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) {
 
     // Read dimensions for each page before mutating
     let dimensions: Vec<(f64, f64)> = page_ids.iter()
-        .enumerate()
-        .map(|(i, &pid)| {
-            get_page_dimensions(doc, pid).unwrap_or_else(|| {
-                crate::geometry::warn(&format!(
-                    "page {} has no MediaBox/CropBox; falling back to US Letter (612x792)",
-                    i + 1
-                ));
-                US_LETTER_FALLBACK
-            })
-        })
+        .map(|&(page_number, pid)| get_page_dimensions_or_fallback(doc, pid, page_number))
         .collect();
 
-    for (i, &page_id) in page_ids.iter().enumerate() {
+    for (i, &(_, page_id)) in page_ids.iter().enumerate() {
         let (page_width, page_height) = dimensions[i];
 
         // Build content stream for all stamp items on this page.
@@ -680,6 +671,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_apply_stamp_config_falls_back_to_us_letter_without_bbox() {
+        // 1-page PDF with no MediaBox/CropBox anywhere: stamping proceeds
+        // against the US Letter fallback (612x792) rather than skipping the
+        // page or using zero-collapsed dimensions. Pins the value of
+        // geometry::US_LETTER_FALLBACK end-to-end through a real call site.
+        let mut doc = Document::new();
+        let pages_id = doc.new_object_id();
+
+        let content_id = doc.add_object(Stream::new(Dictionary::new(), Vec::new()));
+        let mut page_dict = Dictionary::new();
+        page_dict.set("Type", Object::Name(b"Page".to_vec()));
+        page_dict.set("Parent", Object::Reference(pages_id));
+        page_dict.set("Contents", Object::Reference(content_id));
+        let page_id = doc.add_object(page_dict);
+
+        let mut pages_dict = Dictionary::new();
+        pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
+        pages_dict.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
+        pages_dict.set("Count", Object::Integer(1));
+        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
+
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+        catalog.set("Pages", Object::Reference(pages_id));
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        // A line starting at (0 from right, 0 from top): with the fallback
+        // dimensions the start point resolves to exactly (612, 792).
+        let json = r#"{"lines": [{"x1": 0, "y1": 0, "x2": 0, "y2": 0, "x1_origin": "right", "y1_origin": "top"}]}"#;
+        let config: StampConfig = serde_json::from_str(json).unwrap();
+        apply_stamp_config(&mut doc, &config);
+
+        let page = match doc.get_object(page_id) {
+            Ok(Object::Dictionary(ref d)) => d.clone(),
+            other => panic!("expected page dictionary, got {:?}", other),
+        };
+        let contents = match page.get(b"Contents") {
+            Ok(Object::Array(ref a)) => a.clone(),
+            other => panic!("expected /Contents array after stamping, got {:?}", other),
+        };
+        assert_eq!(contents.len(), 2, "Page should have original + stamp content streams");
+
+        let stamp_ref = contents[1].as_reference().unwrap();
+        let content = match doc.get_object(stamp_ref) {
+            Ok(Object::Stream(ref s)) => String::from_utf8_lossy(&s.content).into_owned(),
+            other => panic!("expected stamp stream, got {:?}", other),
+        };
+        assert!(
+            content.contains("612 792 m"),
+            "stamp coordinates should resolve against the US Letter fallback, got: {content}"
+        );
     }
 
     #[test]

@@ -44,7 +44,7 @@ Returns a frozen hash `{ width: Float, height: Float }` with the page dimensions
 
 `page_index` is **0-based**. Raises `ArgumentError` if the index is out of range.
 
-Resolves inherited `/MediaBox` and `/CropBox` attributes by walking the page tree per ISO 32000 §7.7.3.4. Falls back to US Letter (612 × 792 points) if no bounding box is found, and prints a warning to stderr.
+Resolves inherited `/MediaBox` and `/CropBox` attributes by walking the page tree per ISO 32000 §7.7.3.4. Falls back to US Letter (612 × 792 points) if no valid bounding box is found, and prints a warning to stderr.
 
 ### `#stamp_metadata(reader, ip, timestamp, unique_id)` → `nil`
 

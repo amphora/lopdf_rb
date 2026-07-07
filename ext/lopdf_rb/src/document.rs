@@ -6,7 +6,7 @@ use magnus::prelude::*;
 use magnus::value::ReprValue;
 use magnus::{function, method, Error, RArray, RHash, RModule, RString, Symbol, Value};
 
-use crate::geometry::{get_page_dimensions, US_LETTER_FALLBACK};
+use crate::geometry::get_page_dimensions_or_fallback;
 
 /// Ruby wrapper around a `lopdf::Document`.
 ///
@@ -178,13 +178,7 @@ impl RbDocument {
             )
         })?;
 
-        let (width, height) = get_page_dimensions(&doc, *page_id).unwrap_or_else(|| {
-            crate::geometry::warn(&format!(
-                "page {} has no MediaBox/CropBox; falling back to US Letter (612x792)",
-                page_index
-            ));
-            US_LETTER_FALLBACK
-        });
+        let (width, height) = get_page_dimensions_or_fallback(&doc, *page_id, page_number);
 
         let hash = RHash::new();
         hash.aset(Symbol::new("width"), width)?;
