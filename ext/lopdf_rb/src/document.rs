@@ -34,6 +34,14 @@ use crate::geometry::get_page_dimensions;
 /// `borrow()` per input — which is fine: the invariant is per-cell, and those
 /// are distinct `RefCell`s.)
 ///
+/// One scope nuance: in the common `delegate(&mut self.inner.borrow_mut(), …)
+/// .map_err(|e| Error::new(…))` tail expression, the `RefMut` temporary is not
+/// dropped until the whole expression finishes — so the `map_err` closure runs
+/// while the guard is technically still live. Benign today (magnus `Error::new`
+/// with an exception class and `String` message is a pure data constructor, no
+/// Ruby allocation), but error-mapping closures must never re-borrow `inner`
+/// or call back into Ruby.
+///
 /// **Primary risk for future refactors.** `RefCell` enforces the invariant at
 /// *run time*, not compile time — so the compiler will not catch a violation.
 /// A Rust-level composition that holds a `borrow_mut()` guard on a cell while
