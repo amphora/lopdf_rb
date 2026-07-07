@@ -1,9 +1,12 @@
 use lopdf::{text_string, Document, Object, Dictionary};
 
 /// Maximum accepted byte length (UTF-8, as received from Ruby) for each
-/// user-supplied /Info field. An abuse guard against Info-dict bloat, not a
-/// functional limit — real values are tens of bytes.
-pub(crate) const MAX_FIELD_BYTES: usize = 255;
+/// user-supplied /Info field — an abuse guard, not a functional limit.
+/// 512 covers the application's 64-character display-name limit even at
+/// 4 UTF-8 bytes per character (256 bytes), with headroom. The cap is
+/// measured on the input bytes; the encoded on-disk form (a UTF-16BE
+/// hexadecimal string for non-ASCII values) may be larger.
+pub(crate) const MAX_FIELD_BYTES: usize = 512;
 
 /// Validate `(name, value)` pairs against [`MAX_FIELD_BYTES`], naming the
 /// offending field in the error. Lengths are measured on the UTF-8 input,
@@ -183,9 +186,19 @@ mod tests {
 
     #[test]
     fn test_validate_field_lengths_counts_bytes_not_chars() {
-        // 128 chars but 256 UTF-8 bytes — the cap is on bytes
-        let multibyte = "é".repeat(128);
+        // 300 chars but 600 UTF-8 bytes — the cap is on bytes
+        let multibyte = "é".repeat(300);
         assert!(validate_field_lengths(&[("reader", &multibyte)]).is_err());
+    }
+
+    #[test]
+    fn test_validate_field_lengths_accepts_max_length_4_byte_char_name() {
+        // The app validates display names at 64 CHARACTERS; the worst case
+        // is 64 supplementary-plane code points = 256 UTF-8 bytes, which
+        // must fit under the cap (it did not under the original 255).
+        let name = "\u{1F600}".repeat(64);
+        assert_eq!(name.len(), 256);
+        assert!(validate_field_lengths(&[("reader", &name)]).is_ok());
     }
 
     #[test]

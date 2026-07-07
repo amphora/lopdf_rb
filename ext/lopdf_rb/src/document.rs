@@ -219,7 +219,7 @@ impl RbDocument {
     /// ASCII values are stored verbatim, non-ASCII as UTF-16BE with a BOM.
     ///
     /// Raises `ArgumentError` when any argument exceeds
-    /// `metadata::MAX_FIELD_BYTES` (255) bytes of UTF-8, and `RuntimeError`
+    /// `metadata::MAX_FIELD_BYTES` (512) bytes of UTF-8, and `RuntimeError`
     /// when /Info cannot be resolved to a dictionary.
     fn stamp_metadata(
         &self,
