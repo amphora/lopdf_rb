@@ -7,8 +7,10 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 pub(crate) const US_LETTER_FALLBACK: (f64, f64) = (612.0, 792.0);
 
 /// Read page dimensions from MediaBox (or CropBox fallback).
-/// Returns `Some((width, height))` in PDF points, or `None` when neither
-/// MediaBox nor CropBox exists anywhere in the /Parent chain.
+/// Returns `Some((width, height))` in PDF points, or `None` when no valid
+/// MediaBox or CropBox exists anywhere in the /Parent chain — a malformed
+/// bbox (wrong length, non-numeric entries) is treated as absent rather
+/// than yielding zero-collapsed dimensions.
 /// Handles both direct Array values and indirect References.
 ///
 /// Resolves inherited attributes by walking the /Parent chain (ISO 32000 §7.7.3.4).
@@ -57,10 +59,10 @@ fn extract_bbox(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<(f64, f
         };
         if let Some(bbox) = bbox {
             if bbox.len() == 4 {
-                let x1 = obj_to_f64(&bbox[0]);
-                let y1 = obj_to_f64(&bbox[1]);
-                let x2 = obj_to_f64(&bbox[2]);
-                let y2 = obj_to_f64(&bbox[3]);
+                let x1 = obj_to_f64(doc, &bbox[0])?;
+                let y1 = obj_to_f64(doc, &bbox[1])?;
+                let x2 = obj_to_f64(doc, &bbox[2])?;
+                let y2 = obj_to_f64(doc, &bbox[3])?;
                 return Some(((x2 - x1).abs(), (y2 - y1).abs()));
             }
         }
@@ -68,21 +70,53 @@ fn extract_bbox(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<(f64, f
     None
 }
 
-/// Convert a PDF Object (Integer or Real) to f64.
-/// Non-numeric objects (malformed bbox entries) convert to 0.0 with a stderr
-/// diagnostic — a zero coordinate silently misplaces stamps, so the condition
-/// must be observable in all build profiles.
-pub(crate) fn obj_to_f64(obj: &Object) -> f64 {
+/// Convert a PDF Object (Integer or Real, possibly behind an indirect
+/// reference — ISO 32000 permits references as array elements) to f64.
+/// Returns `None` for anything else: the enclosing bbox is malformed, and
+/// treating it as absent lets dimension resolution fall through to the
+/// /Parent chain, CropBox, and ultimately the callers' US Letter fallback
+/// instead of computing stamp coordinates from a zeroed corner. Each
+/// rejection emits a stderr diagnostic so the condition stays observable.
+pub(crate) fn obj_to_f64(doc: &Document, obj: &Object) -> Option<f64> {
     match obj {
-        Object::Integer(i) => *i as f64,
-        Object::Real(f) => (*f).into(),
+        Object::Integer(i) => Some(*i as f64),
+        Object::Real(f) => Some((*f).into()),
+        Object::Reference(id) => match doc.get_object(*id) {
+            Ok(Object::Integer(i)) => Some(*i as f64),
+            Ok(Object::Real(f)) => Some((*f).into()),
+            _ => {
+                eprintln!(
+                    "lopdf_rb: bbox entry reference ({} {}) does not resolve to a number; ignoring bbox",
+                    id.0, id.1
+                );
+                None
+            }
+        },
         _ => {
             eprintln!(
-                "lopdf_rb: non-numeric object in bbox entry: {:?}; treating as 0.0",
-                obj
+                "lopdf_rb: non-numeric object ({}) in bbox entry; ignoring bbox",
+                object_kind(obj)
             );
-            0.0
+            None
         }
+    }
+}
+
+/// Compact variant label for diagnostics. Never Debug-print a whole
+/// untrusted Object: lopdf's Debug impl renders full string/array content
+/// with no size cap, so a hostile bbox entry could flood stderr.
+fn object_kind(obj: &Object) -> &'static str {
+    match obj {
+        Object::Null => "Null",
+        Object::Boolean(_) => "Boolean",
+        Object::Integer(_) => "Integer",
+        Object::Real(_) => "Real",
+        Object::Name(_) => "Name",
+        Object::String(..) => "String",
+        Object::Array(_) => "Array",
+        Object::Dictionary(_) => "Dictionary",
+        Object::Stream(_) => "Stream",
+        Object::Reference(_) => "Reference",
     }
 }
 
@@ -224,15 +258,65 @@ mod tests {
 
     #[test]
     fn test_obj_to_f64_integer_and_real() {
-        assert!((obj_to_f64(&Object::Integer(42)) - 42.0).abs() < f64::EPSILON);
-        assert!((obj_to_f64(&Object::Real(3.14)) - 3.14).abs() < 0.001);
+        let doc = Document::new();
+        assert_eq!(obj_to_f64(&doc, &Object::Integer(42)), Some(42.0));
+        let real = obj_to_f64(&doc, &Object::Real(3.14)).unwrap();
+        assert!((real - 3.14).abs() < 0.001);
     }
 
     #[test]
-    fn test_obj_to_f64_unsupported() {
-        assert!((obj_to_f64(&Object::Boolean(true))).abs() < f64::EPSILON);
-        assert!((obj_to_f64(&Object::Null)).abs() < f64::EPSILON);
-        assert!((obj_to_f64(&Object::Name(b"Foo".to_vec()))).abs() < f64::EPSILON);
+    fn test_obj_to_f64_non_numeric_is_none() {
+        let doc = Document::new();
+        assert_eq!(obj_to_f64(&doc, &Object::Boolean(true)), None);
+        assert_eq!(obj_to_f64(&doc, &Object::Null), None);
+        assert_eq!(obj_to_f64(&doc, &Object::Name(b"Foo".to_vec())), None);
+    }
+
+    #[test]
+    fn test_obj_to_f64_resolves_indirect_reference() {
+        let mut doc = Document::new();
+        let id = doc.add_object(Object::Real(612.5));
+        assert_eq!(obj_to_f64(&doc, &Object::Reference(id)), Some(612.5));
+    }
+
+    #[test]
+    fn test_obj_to_f64_unresolvable_reference_is_none() {
+        let mut doc = Document::new();
+        // Dangling reference, and a reference to a non-numeric object
+        assert_eq!(obj_to_f64(&doc, &Object::Reference((9999, 0))), None);
+        let id = doc.add_object(Object::Name(b"NotANumber".to_vec()));
+        assert_eq!(obj_to_f64(&doc, &Object::Reference(id)), None);
+    }
+
+    #[test]
+    fn test_page_dimensions_malformed_mediabox_falls_through_to_cropbox() {
+        // A MediaBox with a non-numeric entry is treated as absent, so
+        // resolution recovers via the valid CropBox instead of returning
+        // zero-collapsed dimensions.
+        let malformed = vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Null,
+            Object::Integer(792),
+        ];
+        let (doc, page_id) = create_test_pdf(Some(malformed), Some(a4_box()), None);
+        let (w, h) = get_page_dimensions(&doc, page_id).unwrap();
+        assert!((w - 595.28).abs() < 0.01);
+        assert!((h - 841.89).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_page_dimensions_malformed_bbox_only_is_none() {
+        // Only a malformed MediaBox exists → treated as boxless, callers
+        // apply the US Letter fallback.
+        let malformed = vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Null,
+            Object::Integer(792),
+        ];
+        let (doc, page_id) = create_test_pdf(Some(malformed), None, None);
+        assert_eq!(get_page_dimensions(&doc, page_id), None);
     }
 
     #[test]
