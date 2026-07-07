@@ -217,6 +217,14 @@ impl RbDocument {
         timestamp: String,
         unique_id: String,
     ) -> Result<(), Error> {
+        crate::metadata::validate_field_lengths(&[
+            ("reader", &reader),
+            ("ip", &ip),
+            ("timestamp", &timestamp),
+            ("unique_id", &unique_id),
+        ])
+        .map_err(|e| Error::new(magnus::exception::arg_error(), e))?;
+
         crate::metadata::set_metadata(
             &mut self.inner.borrow_mut(),
             &reader,

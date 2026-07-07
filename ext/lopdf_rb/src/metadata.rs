@@ -1,5 +1,27 @@
 use lopdf::{Document, Object, Dictionary, StringFormat};
 
+/// Maximum accepted byte length (UTF-8, as received from Ruby) for each
+/// user-supplied /Info field. An abuse guard against Info-dict bloat, not a
+/// functional limit — real values are tens of bytes.
+pub(crate) const MAX_FIELD_BYTES: usize = 255;
+
+/// Validate `(name, value)` pairs against [`MAX_FIELD_BYTES`], naming the
+/// offending field in the error. Lengths are measured on the UTF-8 input,
+/// before any text-string encoding.
+pub(crate) fn validate_field_lengths(fields: &[(&str, &str)]) -> Result<(), String> {
+    for (name, value) in fields {
+        if value.len() > MAX_FIELD_BYTES {
+            return Err(format!(
+                "{} exceeds the maximum length of {} bytes (got {} bytes)",
+                name,
+                MAX_FIELD_BYTES,
+                value.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn set_metadata(doc: &mut Document, reader: &str, timestamp: &str, unique_id: &str, ip: &str) -> Result<(), String> {
     // Get the existing Info reference, or create a fresh Info dictionary when
     // /Info is missing or not an indirect reference (a direct dictionary is
@@ -156,6 +178,26 @@ mod tests {
         } else {
             panic!("Info object should be a dictionary");
         }
+    }
+
+    #[test]
+    fn test_validate_field_lengths_accepts_cap() {
+        let at_cap = "a".repeat(MAX_FIELD_BYTES);
+        assert!(validate_field_lengths(&[("reader", &at_cap)]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_field_lengths_rejects_over_cap() {
+        let over_cap = "a".repeat(MAX_FIELD_BYTES + 1);
+        let err = validate_field_lengths(&[("reader", "ok"), ("unique_id", &over_cap)]).unwrap_err();
+        assert!(err.starts_with("unique_id exceeds"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_validate_field_lengths_counts_bytes_not_chars() {
+        // 128 chars but 256 UTF-8 bytes — the cap is on bytes
+        let multibyte = "é".repeat(128);
+        assert!(validate_field_lengths(&[("reader", &multibyte)]).is_err());
     }
 
     #[test]
