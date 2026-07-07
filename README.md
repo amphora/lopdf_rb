@@ -55,7 +55,11 @@ Write custom fields to the PDF's `/Info` dictionary:
 - `ReadTimestamp` — ISO 8601 timestamp of the read event
 - `UniqueID` — UUID for this specific read event
 
-Creates the `/Info` dictionary if it doesn't exist. Preserves existing entries.
+Creates the `/Info` dictionary if it doesn't exist. Preserves existing entries — with one exception: if a malformed PDF stores `/Info` as a direct dictionary in the trailer (ISO 32000 requires an indirect reference), it is replaced with a fresh dictionary and its entries are **not** preserved.
+
+ASCII values are stored verbatim; non-ASCII values (e.g. a reader name like "José") are stored as UTF-16BE with a BOM prefix in a hexadecimal string, per ISO 32000 §7.9.2 (via lopdf's `text_string` encoder).
+
+Raises `ArgumentError` if any argument exceeds 512 bytes (UTF-8). Raises `RuntimeError` if the `/Info` entry cannot be resolved to a dictionary (a dangling reference, or a reference to a non-dictionary object).
 
 ```ruby
 doc.stamp_metadata(
