@@ -206,10 +206,21 @@ impl RbDocument {
         Ok(RString::from_slice(&buf.into_inner()))
     }
 
-    /// `doc.stamp_metadata(reader:, ip:, timestamp:, unique_id:)` — set /Info dict entries.
+    /// `doc.stamp_metadata(reader, ip, timestamp, unique_id)` — set /Info dict entries.
+    ///
+    /// Positional arguments, in this order: reader name, reader IP, ISO 8601
+    /// timestamp, unique ID. The delegate `metadata::set_metadata` takes them
+    /// as `(reader, timestamp, unique_id, ip)` — a different order; the
+    /// mapping below is correct, keep it in sync when changing either
+    /// signature.
     ///
     /// Writes 4 custom fields (Reader, ReadTimestamp, UniqueID, ReaderIP) to the
     /// PDF's /Info dictionary. Creates the dictionary if it doesn't exist.
+    /// ASCII values are stored verbatim, non-ASCII as UTF-16BE with a BOM.
+    ///
+    /// Raises `ArgumentError` when any argument exceeds
+    /// `metadata::MAX_FIELD_BYTES` (255) bytes of UTF-8, and `RuntimeError`
+    /// when /Info cannot be resolved to a dictionary.
     fn stamp_metadata(
         &self,
         reader: String,

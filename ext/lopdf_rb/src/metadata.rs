@@ -22,6 +22,27 @@ pub(crate) fn validate_field_lengths(fields: &[(&str, &str)]) -> Result<(), Stri
     Ok(())
 }
 
+/// Write the four read-event fields to the document's `/Info` dictionary.
+///
+/// Parameters, in this function's order:
+/// - `reader` — the reader's display name (`/Reader`)
+/// - `timestamp` — ISO 8601 read timestamp (`/ReadTimestamp`)
+/// - `unique_id` — UUID for this read event (`/UniqueID`)
+/// - `ip` — the reader's IP address (`/ReaderIP`)
+///
+/// NOTE: the Ruby-facing wrapper `RbDocument::stamp_metadata` takes these
+/// positionally as `(reader, ip, timestamp, unique_id)` — a different order.
+/// The mapping at that call site is correct today; keep the two in sync when
+/// changing either signature.
+///
+/// Values are stored as PDF Literal strings via [`encode_text_string`]:
+/// ASCII verbatim, non-ASCII as UTF-16BE with a BOM (ISO 32000 §7.9.2).
+///
+/// A missing `/Info`, or one that is not an indirect reference (a direct
+/// dictionary is malformed — the trailer's `/Info` must be a reference), is
+/// replaced with a fresh indirect dictionary; entries carried by a direct
+/// dictionary are dropped. Errors when `/Info` is a dangling reference or
+/// resolves to a non-dictionary.
 pub(crate) fn set_metadata(doc: &mut Document, reader: &str, timestamp: &str, unique_id: &str, ip: &str) -> Result<(), String> {
     // Get the existing Info reference, or create a fresh Info dictionary when
     // /Info is missing or not an indirect reference (a direct dictionary is
