@@ -1,7 +1,7 @@
 use lopdf::{Document, Object, ObjectId, Dictionary, Stream};
 use serde::Deserialize;
 
-use crate::geometry::{get_page_dimensions, resolve_x, resolve_y};
+use crate::geometry::{get_page_dimensions, resolve_x, resolve_y, US_LETTER_FALLBACK};
 use crate::metrics::text_width_pt;
 
 /// Stamp configuration read from the JSON file produced by Ruby.
@@ -135,7 +135,16 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) {
 
     // Read dimensions for each page before mutating
     let dimensions: Vec<(f64, f64)> = page_ids.iter()
-        .map(|&pid| get_page_dimensions(doc, pid))
+        .enumerate()
+        .map(|(i, &pid)| {
+            get_page_dimensions(doc, pid).unwrap_or_else(|| {
+                eprintln!(
+                    "lopdf_rb: page {} has no MediaBox/CropBox; falling back to US Letter (612x792)",
+                    i + 1
+                );
+                US_LETTER_FALLBACK
+            })
+        })
         .collect();
 
     for (i, &page_id) in page_ids.iter().enumerate() {

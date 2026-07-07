@@ -1,22 +1,23 @@
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
+/// US Letter (width, height) in PDF points — the fallback callers apply when
+/// `get_page_dimensions` returns `None`. Deliberately not applied inside this
+/// module: each caller decides on the fallback and warns, so a boxless page
+/// stays distinguishable from a real US Letter page.
+pub(crate) const US_LETTER_FALLBACK: (f64, f64) = (612.0, 792.0);
+
 /// Read page dimensions from MediaBox (or CropBox fallback).
-/// Returns (width, height) in PDF points.
+/// Returns `Some((width, height))` in PDF points, or `None` when neither
+/// MediaBox nor CropBox exists anywhere in the /Parent chain.
 /// Handles both direct Array values and indirect References.
 ///
 /// Resolves inherited attributes by walking the /Parent chain (ISO 32000 §7.7.3.4).
 /// MediaBox is searched first across the entire chain; CropBox is only used as a
 /// fallback if no MediaBox is found anywhere. Capped at 32 levels to guard against
 /// circular references in malformed PDFs.
-pub(crate) fn get_page_dimensions(doc: &Document, page_id: ObjectId) -> (f64, f64) {
-    if let Some(dims) = find_inherited_bbox(doc, page_id, b"MediaBox") {
-        return dims;
-    }
-    if let Some(dims) = find_inherited_bbox(doc, page_id, b"CropBox") {
-        return dims;
-    }
-    // Fallback to US Letter
-    (612.0, 792.0)
+pub(crate) fn get_page_dimensions(doc: &Document, page_id: ObjectId) -> Option<(f64, f64)> {
+    find_inherited_bbox(doc, page_id, b"MediaBox")
+        .or_else(|| find_inherited_bbox(doc, page_id, b"CropBox"))
 }
 
 /// Walk the /Parent chain looking for a specific bbox key (e.g. MediaBox, CropBox).
@@ -182,7 +183,7 @@ mod tests {
     #[test]
     fn test_page_dimensions_direct_mediabox() {
         let (doc, page_id) = create_test_pdf(Some(us_letter_box()), None, None);
-        let (w, h) = get_page_dimensions(&doc, page_id);
+        let (w, h) = get_page_dimensions(&doc, page_id).unwrap();
         assert!((w - 612.0).abs() < 0.01);
         assert!((h - 792.0).abs() < 0.01);
     }
@@ -191,7 +192,7 @@ mod tests {
     fn test_page_dimensions_inherited_from_parent() {
         // No MediaBox on the page, but parent /Pages has one
         let (doc, page_id) = create_test_pdf(None, None, Some(a4_box()));
-        let (w, h) = get_page_dimensions(&doc, page_id);
+        let (w, h) = get_page_dimensions(&doc, page_id).unwrap();
         assert!((w - 595.28).abs() < 0.01);
         assert!((h - 841.89).abs() < 0.01);
     }
@@ -200,18 +201,16 @@ mod tests {
     fn test_page_dimensions_cropbox_fallback() {
         // No MediaBox anywhere, only CropBox on the page
         let (doc, page_id) = create_test_pdf(None, Some(a4_box()), None);
-        let (w, h) = get_page_dimensions(&doc, page_id);
+        let (w, h) = get_page_dimensions(&doc, page_id).unwrap();
         assert!((w - 595.28).abs() < 0.01);
         assert!((h - 841.89).abs() < 0.01);
     }
 
     #[test]
-    fn test_page_dimensions_default_us_letter() {
-        // No MediaBox or CropBox anywhere → falls back to US Letter
+    fn test_page_dimensions_none_when_no_bbox() {
+        // No MediaBox or CropBox anywhere → None; the fallback is the callers' job
         let (doc, page_id) = create_test_pdf(None, None, None);
-        let (w, h) = get_page_dimensions(&doc, page_id);
-        assert!((w - 612.0).abs() < 0.01);
-        assert!((h - 792.0).abs() < 0.01);
+        assert_eq!(get_page_dimensions(&doc, page_id), None);
     }
 
     #[test]
