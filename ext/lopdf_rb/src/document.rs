@@ -209,10 +209,8 @@ impl RbDocument {
     /// `doc.stamp_metadata(reader, ip, timestamp, unique_id)` — set /Info dict entries.
     ///
     /// Positional arguments, in this order: reader name, reader IP, ISO 8601
-    /// timestamp, unique ID. The delegate `metadata::set_metadata` takes them
-    /// as `(reader, timestamp, unique_id, ip)` — a different order; the
-    /// mapping below is correct, keep it in sync when changing either
-    /// signature.
+    /// timestamp, unique ID (the delegate `metadata::set_metadata` takes the
+    /// same order).
     ///
     /// Writes 4 custom fields (Reader, ReadTimestamp, UniqueID, ReaderIP) to the
     /// PDF's /Info dictionary. Creates the dictionary if it doesn't exist.
@@ -239,9 +237,9 @@ impl RbDocument {
         crate::metadata::set_metadata(
             &mut self.inner.borrow_mut(),
             &reader,
+            &ip,
             &timestamp,
             &unique_id,
-            &ip,
         )
         .map_err(|e| Error::new(magnus::exception::runtime_error(), e))
     }
@@ -544,16 +542,24 @@ mod tests {
         doc
     }
 
-    /// `stamp_metadata` → `borrow_mut()` → `metadata::set_metadata`.
+    /// `stamp_metadata` → `validate_field_lengths` (no borrow, can return
+    /// early) → `borrow_mut()` → `metadata::set_metadata`.
     #[test]
     fn borrow_choreography_stamp_metadata() {
         let cell = RefCell::new(build_pdf(1));
+        crate::metadata::validate_field_lengths(&[
+            ("reader", "Alice"),
+            ("ip", "10.0.0.1"),
+            ("timestamp", "2026-07-01T00:00:00Z"),
+            ("unique_id", "UID-1"),
+        ])
+        .unwrap();
         crate::metadata::set_metadata(
             &mut cell.borrow_mut(),
             "Alice",
+            "10.0.0.1",
             "2026-07-01T00:00:00Z",
             "UID-1",
-            "10.0.0.1",
         )
         .unwrap();
 

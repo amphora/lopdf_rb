@@ -27,16 +27,11 @@ pub(crate) fn validate_field_lengths(fields: &[(&str, &str)]) -> Result<(), Stri
 
 /// Write the four read-event fields to the document's `/Info` dictionary.
 ///
-/// Parameters, in this function's order:
+/// Parameters (same order as the Ruby-facing `RbDocument::stamp_metadata`):
 /// - `reader` — the reader's display name (`/Reader`)
+/// - `ip` — the reader's IP address (`/ReaderIP`)
 /// - `timestamp` — ISO 8601 read timestamp (`/ReadTimestamp`)
 /// - `unique_id` — UUID for this read event (`/UniqueID`)
-/// - `ip` — the reader's IP address (`/ReaderIP`)
-///
-/// NOTE: the Ruby-facing wrapper `RbDocument::stamp_metadata` takes these
-/// positionally as `(reader, ip, timestamp, unique_id)` — a different order.
-/// The mapping at that call site is correct today; keep the two in sync when
-/// changing either signature.
 ///
 /// Values are encoded with [`lopdf::text_string`]: ASCII verbatim as a
 /// Literal string, non-ASCII as UTF-16BE with a BOM in a Hexadecimal
@@ -47,7 +42,7 @@ pub(crate) fn validate_field_lengths(fields: &[(&str, &str)]) -> Result<(), Stri
 /// replaced with a fresh indirect dictionary; entries carried by a direct
 /// dictionary are dropped. Errors when `/Info` is a dangling reference or
 /// resolves to a non-dictionary.
-pub(crate) fn set_metadata(doc: &mut Document, reader: &str, timestamp: &str, unique_id: &str, ip: &str) -> Result<(), String> {
+pub(crate) fn set_metadata(doc: &mut Document, reader: &str, ip: &str, timestamp: &str, unique_id: &str) -> Result<(), String> {
     // Get the existing Info reference, or create a fresh Info dictionary when
     // /Info is missing or not an indirect reference (a direct dictionary is
     // malformed per ISO 32000 — the trailer's /Info must be a reference).
@@ -63,10 +58,14 @@ pub(crate) fn set_metadata(doc: &mut Document, reader: &str, timestamp: &str, un
 
     match doc.get_object_mut(info_id) {
         Ok(Object::Dictionary(dict)) => {
-            dict.set("Reader", text_string(reader));
-            dict.set("ReadTimestamp", text_string(timestamp));
-            dict.set("UniqueID", text_string(unique_id));
-            dict.set("ReaderIP", text_string(ip));
+            for (key, value) in [
+                ("Reader", reader),
+                ("ReaderIP", ip),
+                ("ReadTimestamp", timestamp),
+                ("UniqueID", unique_id),
+            ] {
+                dict.set(key, text_string(value));
+            }
             Ok(())
         }
         Ok(_) => Err(format!("/Info object {:?} is not a dictionary", info_id)),
@@ -93,7 +92,7 @@ mod tests {
         let mut doc = create_empty_pdf();
         assert!(doc.trailer.get(b"Info").is_err());
 
-        set_metadata(&mut doc, "Alex", "2026-03-16T11:00:00.000Z", "550e8400-uuid", "10.0.0.1").unwrap();
+        set_metadata(&mut doc, "Alex", "10.0.0.1", "2026-03-16T11:00:00.000Z", "550e8400-uuid").unwrap();
 
         let info_ref = doc.trailer.get(b"Info").unwrap().as_reference().unwrap();
         if let Ok(Object::Dictionary(ref dict)) = doc.get_object(info_ref) {
@@ -126,7 +125,7 @@ mod tests {
         let info_id = doc.add_object(info);
         doc.trailer.set("Info", Object::Reference(info_id));
 
-        set_metadata(&mut doc, "Bob", "2026-01-01T00:00:00.000Z", "uuid-123", "192.168.1.1").unwrap();
+        set_metadata(&mut doc, "Bob", "192.168.1.1", "2026-01-01T00:00:00.000Z", "uuid-123").unwrap();
 
         if let Ok(Object::Dictionary(ref dict)) = doc.get_object(info_id) {
             // Original field preserved
@@ -148,7 +147,7 @@ mod tests {
     fn test_set_metadata_encodes_non_ascii_reader_as_utf16be() {
         let mut doc = create_empty_pdf();
 
-        set_metadata(&mut doc, "José", "2026-01-01T00:00:00.000Z", "uuid-123", "10.0.0.1").unwrap();
+        set_metadata(&mut doc, "José", "10.0.0.1", "2026-01-01T00:00:00.000Z", "uuid-123").unwrap();
 
         let info_ref = doc.trailer.get(b"Info").unwrap().as_reference().unwrap();
         if let Ok(Object::Dictionary(ref dict)) = doc.get_object(info_ref) {
@@ -206,7 +205,7 @@ mod tests {
         let mut doc = create_empty_pdf();
         doc.trailer.set("Info", Object::Reference((9999, 0)));
 
-        let result = set_metadata(&mut doc, "Alex", "2026-01-01T00:00:00.000Z", "uuid-123", "10.0.0.1");
+        let result = set_metadata(&mut doc, "Alex", "10.0.0.1", "2026-01-01T00:00:00.000Z", "uuid-123");
 
         let err = result.unwrap_err();
         assert!(err.contains("failed to resolve /Info object"), "unexpected error: {err}");
@@ -218,7 +217,7 @@ mod tests {
         let bogus_id = doc.add_object(Object::Integer(42));
         doc.trailer.set("Info", Object::Reference(bogus_id));
 
-        let result = set_metadata(&mut doc, "Alex", "2026-01-01T00:00:00.000Z", "uuid-123", "10.0.0.1");
+        let result = set_metadata(&mut doc, "Alex", "10.0.0.1", "2026-01-01T00:00:00.000Z", "uuid-123");
 
         let err = result.unwrap_err();
         assert!(err.contains("is not a dictionary"), "unexpected error: {err}");
@@ -237,7 +236,7 @@ mod tests {
         info.set("Author", Object::String(b"Existing Author".to_vec(), StringFormat::Literal));
         doc.trailer.set("Info", Object::Dictionary(info));
 
-        set_metadata(&mut doc, "Alex", "2026-01-01T00:00:00.000Z", "uuid-123", "10.0.0.1").unwrap();
+        set_metadata(&mut doc, "Alex", "10.0.0.1", "2026-01-01T00:00:00.000Z", "uuid-123").unwrap();
 
         // The trailer now holds an indirect reference to a fresh dictionary
         // carrying the four fields; the direct dict's entries are gone.
