@@ -223,8 +223,8 @@ impl RbDocument {
             &timestamp,
             &unique_id,
             &ip,
-        );
-        Ok(())
+        )
+        .map_err(|e| Error::new(magnus::exception::runtime_error(), e))
     }
 
     /// `doc.add_dlp_annotation(dlp_json)` — add a hidden FreeText annotation on the last page.
@@ -535,7 +535,8 @@ mod tests {
             "2026-07-01T00:00:00Z",
             "UID-1",
             "10.0.0.1",
-        );
+        )
+        .unwrap();
 
         let doc = cell.borrow();
         let info_id = doc.trailer.get(b"Info").unwrap().as_reference().unwrap();
