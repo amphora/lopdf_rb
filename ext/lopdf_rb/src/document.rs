@@ -179,10 +179,10 @@ impl RbDocument {
         })?;
 
         let (width, height) = get_page_dimensions(&doc, *page_id).unwrap_or_else(|| {
-            eprintln!(
-                "lopdf_rb: page {} has no MediaBox/CropBox; falling back to US Letter (612x792)",
+            crate::geometry::warn(&format!(
+                "page {} has no MediaBox/CropBox; falling back to US Letter (612x792)",
                 page_index
-            );
+            ));
             US_LETTER_FALLBACK
         });
 

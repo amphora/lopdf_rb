@@ -138,10 +138,10 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) {
         .enumerate()
         .map(|(i, &pid)| {
             get_page_dimensions(doc, pid).unwrap_or_else(|| {
-                eprintln!(
-                    "lopdf_rb: page {} has no MediaBox/CropBox; falling back to US Letter (612x792)",
+                crate::geometry::warn(&format!(
+                    "page {} has no MediaBox/CropBox; falling back to US Letter (612x792)",
                     i + 1
-                );
+                ));
                 US_LETTER_FALLBACK
             })
         })

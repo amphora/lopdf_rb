@@ -1,4 +1,13 @@
 use lopdf::{Dictionary, Document, Object, ObjectId};
+use std::io::Write;
+
+/// Panic-safe stderr diagnostic. `eprintln!` panics if the write to fd 2
+/// fails (closed or broken pipe under a supervisor/log shipper); magnus
+/// converts a Rust panic into an unrescuable Ruby `fatal`, so a failed log
+/// line must never unwind — the write result is deliberately discarded.
+pub(crate) fn warn(msg: &str) {
+    let _ = writeln!(std::io::stderr(), "lopdf_rb: {}", msg);
+}
 
 /// US Letter (width, height) in PDF points — the fallback callers apply when
 /// `get_page_dimensions` returns `None`. Deliberately not applied inside this
@@ -85,18 +94,18 @@ pub(crate) fn obj_to_f64(doc: &Document, obj: &Object) -> Option<f64> {
             Ok(Object::Integer(i)) => Some(*i as f64),
             Ok(Object::Real(f)) => Some((*f).into()),
             _ => {
-                eprintln!(
-                    "lopdf_rb: bbox entry reference ({} {}) does not resolve to a number; ignoring bbox",
+                warn(&format!(
+                    "bbox entry reference ({} {}) does not resolve to a number; ignoring bbox",
                     id.0, id.1
-                );
+                ));
                 None
             }
         },
         _ => {
-            eprintln!(
-                "lopdf_rb: non-numeric object ({}) in bbox entry; ignoring bbox",
+            warn(&format!(
+                "non-numeric object ({}) in bbox entry; ignoring bbox",
                 object_kind(obj)
-            );
+            ));
             None
         }
     }
