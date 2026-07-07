@@ -1,4 +1,4 @@
-use lopdf::{Document, Object, Dictionary, StringFormat};
+use lopdf::{text_string, Document, Object, Dictionary};
 
 /// Maximum accepted byte length (UTF-8, as received from Ruby) for each
 /// user-supplied /Info field. An abuse guard against Info-dict bloat, not a
@@ -35,8 +35,9 @@ pub(crate) fn validate_field_lengths(fields: &[(&str, &str)]) -> Result<(), Stri
 /// The mapping at that call site is correct today; keep the two in sync when
 /// changing either signature.
 ///
-/// Values are stored as PDF Literal strings via [`encode_text_string`]:
-/// ASCII verbatim, non-ASCII as UTF-16BE with a BOM (ISO 32000 §7.9.2).
+/// Values are encoded with [`lopdf::text_string`]: ASCII verbatim as a
+/// Literal string, non-ASCII as UTF-16BE with a BOM in a Hexadecimal
+/// string (ISO 32000 §7.9.2).
 ///
 /// A missing `/Info`, or one that is not an indirect reference (a direct
 /// dictionary is malformed — the trailer's `/Info` must be a reference), is
@@ -59,10 +60,10 @@ pub(crate) fn set_metadata(doc: &mut Document, reader: &str, timestamp: &str, un
 
     match doc.get_object_mut(info_id) {
         Ok(Object::Dictionary(dict)) => {
-            dict.set("Reader", Object::String(encode_text_string(reader), StringFormat::Literal));
-            dict.set("ReadTimestamp", Object::String(encode_text_string(timestamp), StringFormat::Literal));
-            dict.set("UniqueID", Object::String(encode_text_string(unique_id), StringFormat::Literal));
-            dict.set("ReaderIP", Object::String(encode_text_string(ip), StringFormat::Literal));
+            dict.set("Reader", text_string(reader));
+            dict.set("ReadTimestamp", text_string(timestamp));
+            dict.set("UniqueID", text_string(unique_id));
+            dict.set("ReaderIP", text_string(ip));
             Ok(())
         }
         Ok(_) => Err(format!("/Info object {:?} is not a dictionary", info_id)),
@@ -70,30 +71,10 @@ pub(crate) fn set_metadata(doc: &mut Document, reader: &str, timestamp: &str, un
     }
 }
 
-/// Encode a UTF-8 string for storage as a PDF text string (ISO 32000 §7.9.2):
-/// ASCII passes through verbatim (ASCII is a subset of PDFDocEncoding);
-/// anything else becomes UTF-16BE prefixed with the \xFE\xFF BOM. Raw UTF-8
-/// bytes are not a valid text-string encoding and viewers mis-decode them.
-///
-/// The UTF-16BE bytes may contain 0x0D (e.g. "č" = U+010D), which an
-/// unescaped Literal string would corrupt to 0x0A on read; safe here because
-/// lopdf's writer (pinned =0.34) escapes `\r` in Literal strings.
-fn encode_text_string(s: &str) -> Vec<u8> {
-    if s.is_ascii() {
-        return s.as_bytes().to_vec();
-    }
-    let mut bytes = Vec::with_capacity(2 + s.len() * 2);
-    bytes.extend_from_slice(&[0xFE, 0xFF]);
-    for unit in s.encode_utf16() {
-        bytes.extend_from_slice(&unit.to_be_bytes());
-    }
-    bytes
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lopdf::Document;
+    use lopdf::{Document, StringFormat};
 
     fn create_empty_pdf() -> Document {
         let mut doc = Document::new();
@@ -161,22 +142,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_text_string_ascii_passthrough() {
-        assert_eq!(encode_text_string("Alex"), b"Alex".to_vec());
-    }
-
-    #[test]
-    fn test_encode_text_string_non_ascii_utf16be() {
-        assert_eq!(
-            encode_text_string("José"),
-            vec![0xFE, 0xFF, 0x00, 0x4A, 0x00, 0x6F, 0x00, 0x73, 0x00, 0xE9]
-        );
-        // "č" (U+010D): its UTF-16BE bytes contain 0x0D — the CR byte the
-        // Literal-string carrier depends on lopdf's writer escaping.
-        assert_eq!(encode_text_string("č"), vec![0xFE, 0xFF, 0x01, 0x0D]);
-    }
-
-    #[test]
     fn test_set_metadata_encodes_non_ascii_reader_as_utf16be() {
         let mut doc = create_empty_pdf();
 
@@ -184,14 +149,16 @@ mod tests {
 
         let info_ref = doc.trailer.get(b"Info").unwrap().as_reference().unwrap();
         if let Ok(Object::Dictionary(ref dict)) = doc.get_object(info_ref) {
+            // Pins the lopdf::text_string contract this crate relies on:
+            // non-ASCII → BOM-prefixed UTF-16BE in a Hexadecimal string.
             assert_eq!(
                 dict.get(b"Reader").unwrap(),
                 &Object::String(
                     vec![0xFE, 0xFF, 0x00, 0x4A, 0x00, 0x6F, 0x00, 0x73, 0x00, 0xE9],
-                    StringFormat::Literal
+                    StringFormat::Hexadecimal
                 )
             );
-            // ASCII siblings in the same call stay verbatim
+            // ASCII siblings in the same call stay verbatim Literal strings
             assert_eq!(
                 dict.get(b"ReaderIP").unwrap(),
                 &Object::String(b"10.0.0.1".to_vec(), StringFormat::Literal)
