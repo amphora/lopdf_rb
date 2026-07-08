@@ -691,6 +691,11 @@ fn add_font_to_resources(resources: &mut Dictionary, font_name: &str, font_id: O
     match resources.get(b"Font") {
         Ok(Object::Reference(ref_id)) => return Some(*ref_id),
         Ok(Object::Dictionary(_)) => {}
+        // A Reference was diverted to the caller above. Any other value
+        // cannot hold font entries, so replacing it (or creating a missing
+        // /Font) repairs the malformed entry without discarding fonts —
+        // unlike the indirect case, where an unresolvable reference is an
+        // error upstream (see write_font_through_ref / ensure_font).
         _ => resources.set("Font", Object::Dictionary(Dictionary::new())),
     }
     if let Ok(Object::Dictionary(ref mut fonts)) = resources.get_mut(b"Font") {
@@ -1478,6 +1483,35 @@ mod tests {
             err.contains("cannot resolve /Resources reference"),
             "unexpected error message: {err}"
         );
+    }
+
+    #[test]
+    fn test_ensure_font_repairs_malformed_direct_font_value() {
+        // The direct-repair/indirect-error asymmetry (annotation.rs states
+        // it for /Annots): a malformed direct /Font value cannot hold font
+        // entries, so replacing it discards nothing — unlike an
+        // unresolvable /Font reference, which is an Err.
+        let (mut doc, page_ids) = build_test_pdf(1, Some(us_letter_box()));
+        let page_id = page_ids[0];
+        set_page_font(&mut doc, page_id, Object::Integer(7));
+
+        let font_name = ensure_font(&mut doc, page_id, "Courier")
+            .expect("a malformed direct /Font value should be repaired");
+        assert_eq!(font_name, "F_PS_Courier");
+
+        match doc.get_object(page_id) {
+            Ok(Object::Dictionary(ref page_dict)) => match page_dict.get(b"Resources") {
+                Ok(Object::Dictionary(ref resources)) => match resources.get(b"Font") {
+                    Ok(Object::Dictionary(ref fonts)) => assert!(
+                        matches!(fonts.get(b"F_PS_Courier"), Ok(Object::Reference(_))),
+                        "repaired /Font dict should hold the new font reference"
+                    ),
+                    other => panic!("expected repaired direct /Font dict, got {other:?}"),
+                },
+                other => panic!("expected direct /Resources, got {other:?}"),
+            },
+            other => panic!("expected page dictionary, got {other:?}"),
+        }
     }
 
     #[test]
