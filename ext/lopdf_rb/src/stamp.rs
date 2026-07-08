@@ -469,12 +469,15 @@ fn resolve_base_font(font: &Option<String>) -> &str {
 /// and leaves the page untouched — no clone, no page-local /Resources.
 ///
 /// Returns `Err` when the page or its /Resources cannot be accessed for
-/// mutation, or when a /Font reference does not resolve to a dictionary —
-/// a swallowed failure here would leave content streams referencing a font
+/// mutation, when a /Font reference does not resolve to a dictionary, or
+/// when a /Resources entry — on the page or any /Parent ancestor consulted
+/// during the walk — is a Reference that does not resolve to a dictionary.
+/// A swallowed failure here would leave content streams referencing a font
 /// that was never registered, which renders blank.
-/// On `Err` the freshly created font object has already been added to the
-/// document but is wired into no /Resources — an orphan, harmless because
-/// callers discard the document on error (see `apply_stamp_config`).
+/// On `Err` from the /Parent walk the page is untouched; on later `Err`s
+/// the freshly created font object has already been added to the document
+/// but is wired into no /Resources — an orphan, harmless because callers
+/// discard the document on error (see `apply_stamp_config`).
 fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> Result<String, String> {
     // Phase 1: Walk /Parent chain to find /Resources (inheritable per ISO 32000).
     // Snapshot the location so we can mutate afterwards without borrow conflicts.
@@ -494,14 +497,24 @@ fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> Result
         if let Ok(Object::Dictionary(ref dict)) = doc.get_object(current_id) {
             match dict.get(b"Resources") {
                 Ok(Object::Reference(ref_id)) => {
-                    if let Ok(Object::Dictionary(ref resources)) = doc.get_object(*ref_id) {
-                        existing_name = find_font_in_resources(doc, resources, base_font);
-                        location = if is_leaf {
-                            ResourcesLocation::IndirectOnLeaf(*ref_id)
-                        } else {
-                            ResourcesLocation::Inherited(resources.clone())
-                        };
-                    }
+                    // The nearest /Resources governs this page (ISO 32000
+                    // §7.7.3.4) and becomes Phase 2's write target, so an
+                    // unresolvable reference cannot be a lookup miss: walking
+                    // on would substitute an ancestor no conforming reader
+                    // consults, and falling to `Missing` would silently
+                    // replace the corrupt entry with a fresh dict.
+                    let resources = doc
+                        .get_object(*ref_id)
+                        .and_then(Object::as_dict)
+                        .map_err(|e| {
+                            format!("cannot resolve /Resources reference {ref_id:?} for font {base_font}: {e}")
+                        })?;
+                    existing_name = find_font_in_resources(doc, resources, base_font);
+                    location = if is_leaf {
+                        ResourcesLocation::IndirectOnLeaf(*ref_id)
+                    } else {
+                        ResourcesLocation::Inherited(resources.clone())
+                    };
                     break;
                 }
                 Ok(Object::Dictionary(ref resources)) => {
@@ -1335,6 +1348,83 @@ mod tests {
             .expect_err("a dangling inherited /Font reference must fail");
         assert!(
             err.contains("cannot register font Courier"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_ensure_font_errors_when_leaf_resources_dangling() {
+        // Pre-AMPHTT-1234 a dangling leaf /Resources reference fell through
+        // to the Missing branch, which silently replaced it with a fresh
+        // direct dict holding only the stamp font. Pins the Err contract
+        // and that the corrupt reference is left in place.
+        let (mut doc, page_ids) = build_test_pdf(1, Some(us_letter_box()));
+        let page_id = page_ids[0];
+        if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
+            page_dict.set("Resources", Object::Reference((9999, 0)));
+        }
+
+        let err = ensure_font(&mut doc, page_id, "Helvetica")
+            .expect_err("a dangling leaf /Resources reference must fail font registration");
+        assert!(
+            err.contains("cannot resolve /Resources reference"),
+            "unexpected error message: {err}"
+        );
+
+        // The page must be untouched — the Err fires in the /Parent walk,
+        // before any Phase 2 write could replace the reference.
+        match doc.get_object(page_id) {
+            Ok(Object::Dictionary(ref page_dict)) => match page_dict.get(b"Resources") {
+                Ok(Object::Reference(r)) => assert_eq!(*r, (9999, 0)),
+                other => panic!("dangling /Resources reference was replaced with {other:?}"),
+            },
+            other => panic!("expected page dictionary, got {other:?}"),
+        }
+
+        // The ok-but-not-a-Dictionary shape (as_dict failure).
+        let int_id = doc.add_object(Object::Integer(7));
+        if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
+            page_dict.set("Resources", Object::Reference(int_id));
+        }
+        let err = ensure_font(&mut doc, page_id, "Courier")
+            .expect_err("a /Resources reference to a non-dictionary must fail font registration");
+        assert!(
+            err.contains("cannot resolve /Resources reference"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_ensure_font_errors_when_intermediate_resources_dangling() {
+        // Uniform contract: an unresolvable /Resources reference on an
+        // intermediate /Parent node is an Err even when a grandparent
+        // holds valid resources with the requested font — the walk must
+        // not repair corruption by consulting ancestors past the nearest
+        // /Resources entry (the one a conforming reader uses, ISO 32000
+        // §7.7.3.4).
+        let (mut doc, page_ids) = build_test_pdf(1, Some(us_letter_box()));
+        let page_id = page_ids[0];
+        let pages_id = parent_pages_id(&doc, page_id);
+
+        let courier_id = add_type1_font(&mut doc, "Courier");
+        let mut fonts = Dictionary::new();
+        fonts.set("F1", Object::Reference(courier_id));
+        let mut gp_resources = Dictionary::new();
+        gp_resources.set("Font", Object::Dictionary(fonts));
+        let mut grandparent = Dictionary::new();
+        grandparent.set("Type", Object::Name(b"Pages".to_vec()));
+        grandparent.set("Resources", Object::Dictionary(gp_resources));
+        let grandparent_id = doc.add_object(Object::Dictionary(grandparent));
+
+        if let Ok(Object::Dictionary(ref mut pages_dict)) = doc.get_object_mut(pages_id) {
+            pages_dict.set("Parent", Object::Reference(grandparent_id));
+            pages_dict.set("Resources", Object::Reference((9999, 0)));
+        }
+
+        let err = ensure_font(&mut doc, page_id, "Courier")
+            .expect_err("a dangling intermediate /Resources reference must fail");
+        assert!(
+            err.contains("cannot resolve /Resources reference"),
             "unexpected error message: {err}"
         );
     }
