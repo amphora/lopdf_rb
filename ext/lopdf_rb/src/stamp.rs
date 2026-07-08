@@ -1,5 +1,5 @@
 use lopdf::{Document, Object, ObjectId, Dictionary, Stream};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::geometry::{get_page_dimensions_or_fallback, resolve_x, resolve_y};
 use crate::metrics::text_width_pt;
@@ -41,7 +41,8 @@ struct StampItem {
     origin_x: String,       // "left" | "right" | "centre"
     origin_y: String,       // "top" | "bottom" | "middle"
     size: f64,
-    color: [f64; 3],        // RGB 0.0–1.0
+    #[serde(deserialize_with = "deserialize_rgb")]
+    color: [f64; 3],        // RGB 0.0–1.0, clamped at deserialization
     font: Option<String>,   // PDF base font name; defaults to Helvetica
     align: Option<String>,          // "left" | "centre" | "right"
     vertical_align: Option<String>, // "bottom" | "top" | "middle"
@@ -60,7 +61,7 @@ struct TextBlockItem {
     origin_y: String,
     #[serde(default = "default_font_size")]
     size: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_rgb")]
     color: [f64; 3],
     font: Option<String>,
     width: f64,
@@ -82,7 +83,7 @@ struct LineItem {
     x2_origin: String,
     #[serde(default = "default_bottom")]
     y2_origin: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_rgb")]
     color: [f64; 3],
     #[serde(default = "default_thickness")]
     thickness: f64,
@@ -103,7 +104,7 @@ struct RectangleItem {
     x2_origin: String,
     #[serde(default = "default_bottom")]
     y2_origin: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_rgb")]
     color: [f64; 3],
     #[serde(default = "default_thickness")]
     thickness: f64,
@@ -113,6 +114,31 @@ fn default_left() -> String { "left".to_string() }
 fn default_bottom() -> String { "bottom".to_string() }
 fn default_font_size() -> f64 { 12.0 }
 fn default_thickness() -> f64 { 0.5 }
+
+/// Clamp a colour channel into the [0.0, 1.0] range DeviceRGB operands
+/// require (ISO 32000 §8.6.4.2). Out-of-range channels are corrected
+/// silently, consistent with the crate's silent-correction convention
+/// (unknown fonts fall back to Helvetica, unknown origins fall through to
+/// defaults). The `+ 0.0` normalizes IEEE-754 negative zero to positive
+/// zero — `-0.0` is inside the clamp range but would Display as "-0" in
+/// the content stream. Channels are always finite here: the config arrives
+/// as JSON, which cannot encode NaN/Infinity.
+fn clamp_unit_channel(v: f64) -> f64 {
+    v.clamp(0.0, 1.0) + 0.0
+}
+
+/// Deserialize an RGB triple, normalizing every channel via
+/// `clamp_unit_channel`. Applied to each colour field on the stamp item
+/// structs so the stored values are safe to interpolate into content
+/// streams by construction — a future write site cannot reintroduce
+/// out-of-range operands by formatting the raw field.
+fn deserialize_rgb<'de, D>(deserializer: D) -> Result<[f64; 3], D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let channels = <[f64; 3]>::deserialize(deserializer)?;
+    Ok(channels.map(clamp_unit_channel))
+}
 
 /// Apply stamp config to every page in the document.
 ///
@@ -157,8 +183,8 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) -> Re
             let abs_y2 = resolve_y(line.y2, &line.y2_origin, page_height);
 
             content_parts.push(format!(
-                "q {} RG {} w {} {} m {} {} l S Q",
-                clamped_rgb(&line.color),
+                "q {} {} {} RG {} w {} {} m {} {} l S Q",
+                line.color[0], line.color[1], line.color[2],
                 line.thickness,
                 abs_x1, abs_y1,
                 abs_x2, abs_y2
@@ -177,8 +203,8 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) -> Re
             let rh = (abs_y2 - abs_y1).abs();
 
             content_parts.push(format!(
-                "q {} RG {} w {} {} {} {} re S Q",
-                clamped_rgb(&rect.color),
+                "q {} {} {} RG {} w {} {} {} {} re S Q",
+                rect.color[0], rect.color[1], rect.color[2],
                 rect.thickness,
                 rx, ry, rw, rh
             ));
@@ -222,8 +248,8 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) -> Re
             };
 
             content_parts.push(format!(
-                "q {} rg BT /{} {} Tf {} ({}) Tj ET Q",
-                clamped_rgb(&item.color),
+                "q {} {} {} rg BT /{} {} Tf {} ({}) Tj ET Q",
+                item.color[0], item.color[1], item.color[2],
                 font_name, item.size,
                 position_op,
                 escape_pdf_text(&item.text)
@@ -244,8 +270,8 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) -> Re
             for (line_idx, line) in lines.iter().enumerate() {
                 let line_y = abs_y - (line_idx as f64 * block.line_spacing);
                 content_parts.push(format!(
-                    "q {} rg BT /{} {} Tf {} {} Td ({}) Tj ET Q",
-                    clamped_rgb(&block.color),
+                    "q {} {} {} rg BT /{} {} Tf {} {} Td ({}) Tj ET Q",
+                    block.color[0], block.color[1], block.color[2],
                     font_name, block.size,
                     abs_x, line_y,
                     escape_pdf_text(line)
@@ -315,22 +341,6 @@ fn wrap_text(text: &str, base_font: &str, font_size: f64, max_width: f64) -> Vec
     }
 
     lines
-}
-
-/// Format an RGB triple as content-stream colour operands, clamping each
-/// channel into the [0.0, 1.0] range DeviceRGB operands require
-/// (ISO 32000 §8.6.4.2). Out-of-range channels are corrected silently,
-/// consistent with the crate's silent-correction convention (unknown fonts
-/// fall back to Helvetica, unknown origins fall through to defaults).
-/// Channels are always finite here: the config arrives as JSON, which cannot
-/// encode NaN/Infinity, and serde_json rejects non-finite numbers at parse.
-fn clamped_rgb(color: &[f64; 3]) -> String {
-    format!(
-        "{} {} {}",
-        color[0].clamp(0.0, 1.0),
-        color[1].clamp(0.0, 1.0),
-        color[2].clamp(0.0, 1.0)
-    )
 }
 
 /// Escape special characters for a PDF text string (parenthesised literal).
@@ -638,10 +648,20 @@ mod tests {
     }
 
     #[test]
-    fn clamped_rgb_clamps_out_of_range_channels() {
-        assert_eq!(clamped_rgb(&[1.5, -0.25, 0.5]), "1 0 0.5");
-        // In-range channels pass through unchanged
-        assert_eq!(clamped_rgb(&[0.0, 0.42, 1.0]), "0 0.42 1");
+    fn deserialize_rgb_clamps_and_normalizes_channels() {
+        let json = r#"{"x1": 0, "y1": 0, "x2": 1, "y2": 1, "color": [1.5, -0.25, 0.5]}"#;
+        let line: LineItem = serde_json::from_str(json).unwrap();
+        assert_eq!(line.color, [1.0, 0.0, 0.5]);
+
+        // In-range channels pass through unchanged; negative zero is
+        // normalized to +0.0 (it compares equal, so assert the sign bit).
+        let json = r#"{"x1": 0, "y1": 0, "x2": 1, "y2": 1, "color": [-0.0, 0.42, 1.0]}"#;
+        let line: LineItem = serde_json::from_str(json).unwrap();
+        assert_eq!(line.color, [0.0, 0.42, 1.0]);
+        assert!(
+            line.color[0].is_sign_positive(),
+            "negative zero should be normalized to +0.0"
+        );
     }
 
     #[test]
@@ -889,8 +909,9 @@ mod tests {
     #[test]
     fn test_apply_stamp_config_clamps_rgb_in_content_stream() {
         // Out-of-range channels must be clamped into DeviceRGB's [0.0, 1.0]
-        // at the point of content-stream insertion, covering both a stroke
-        // (RG, line) and a fill (rg, stamp text) operator.
+        // before reaching the content stream, covering both a stroke
+        // (RG, line) and a fill (rg, stamp text) operator, plus negative
+        // zero (in-range for clamp, but would emit "-0" unnormalized).
         let mut doc = Document::new();
         let pages_id = doc.new_object_id();
 
@@ -919,7 +940,7 @@ mod tests {
 
         let json = r#"{
             "stamps": [{"text": "X", "x": 10, "y": 10, "origin_x": "left", "origin_y": "bottom", "size": 12, "color": [1.5, -0.25, 0.5]}],
-            "lines": [{"x1": 0, "y1": 0, "x2": 100, "y2": 0, "color": [1.5, -0.25, 0.5]}]
+            "lines": [{"x1": 0, "y1": 0, "x2": 100, "y2": 0, "color": [-0.0, -0.25, 0.5]}]
         }"#;
         let config: StampConfig = serde_json::from_str(json).unwrap();
         apply_stamp_config(&mut doc, &config).expect("stamping should succeed");
@@ -938,16 +959,16 @@ mod tests {
         };
 
         assert!(
-            content.contains("1 0 0.5 RG"),
-            "line stroke colour should be clamped, got: {content}"
+            content.contains("0 0 0.5 RG"),
+            "line stroke colour should be clamped and sign-normalized, got: {content}"
         );
         assert!(
             content.contains("1 0 0.5 rg"),
             "stamp fill colour should be clamped, got: {content}"
         );
         assert!(
-            !content.contains("1.5") && !content.contains("-0.25"),
-            "unclamped channel values must never reach the output, got: {content}"
+            !content.contains("1.5") && !content.contains("-0"),
+            "unclamped or negative-zero channel values must never reach the output, got: {content}"
         );
     }
 
