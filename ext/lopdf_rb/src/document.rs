@@ -269,6 +269,11 @@ impl RbDocument {
     /// Converts to JSON via `to_json`, then deserializes into StampConfig to
     /// preserve all serde defaults. The JSON round-trip overhead (~microseconds)
     /// is negligible vs PDF processing.
+    ///
+    /// Raises `ArgumentError` when the config does not deserialize, and
+    /// `RuntimeError` when a stamp cannot be applied (font registration or
+    /// content-stream append fails) — the document is partially stamped in
+    /// memory at that point and must be discarded, not saved.
     fn apply_visible_stamps(&self, config: Value) -> Result<(), Error> {
         let json_str: String = config.funcall("to_json", ())?;
 
@@ -280,8 +285,8 @@ impl RbDocument {
                 )
             })?;
 
-        crate::stamp::apply_stamp_config(&mut self.inner.borrow_mut(), &stamp_config);
-        Ok(())
+        crate::stamp::apply_stamp_config(&mut self.inner.borrow_mut(), &stamp_config)
+            .map_err(|e| Error::new(magnus::exception::runtime_error(), e))
     }
 
     /// `doc.rotate_all_pages(angle)` — rotate all pages by the given angle.
@@ -511,7 +516,8 @@ mod tests {
         let config: crate::stamp::StampConfig =
             serde_json::from_str(r#"{"rectangles":[{"x1":10,"y1":10,"x2":100,"y2":100}]}"#)
                 .unwrap();
-        crate::stamp::apply_stamp_config(&mut cell.borrow_mut(), &config);
+        crate::stamp::apply_stamp_config(&mut cell.borrow_mut(), &config)
+            .expect("stamping should succeed");
 
         let doc = cell.borrow();
         assert_eq!(doc.get_pages().len(), 2, "page count unchanged");

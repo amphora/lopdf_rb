@@ -4,8 +4,9 @@
 //! files for the base 14 fonts, as specified by ISO 32000-1:2008 §9.6.2.2
 //! and Annex D. Widths are in units of 1/1000 of the text space unit.
 //!
-//! Standard base fonts use WinAnsiEncoding — each character code 0–255 maps to
-//! exactly one glyph. Stamp text is ASCII-range (document IDs, names, dates),
+//! Most standard base fonts use WinAnsiEncoding — each character code 0–255
+//! maps to exactly one glyph. Symbol and ZapfDingbats use their own built-in
+//! encodings instead. Stamp text is ASCII-range (document IDs, names, dates),
 //! so byte-level width indexing is correct.
 
 /// Glyph widths for a single font face, indexed by character code (0–255).

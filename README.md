@@ -123,7 +123,9 @@ doc.apply_visible_stamps({
 })
 ```
 
-Raises `ArgumentError` if the config hash cannot be deserialized.
+Raises `ArgumentError` if the config hash cannot be deserialized, and `RuntimeError` if a stamp cannot be applied (e.g. a font cannot be registered into a page's `/Resources`) — discard the document on error rather than saving it.
+
+Colour channels outside 0.0–1.0 are clamped into range (DeviceRGB operands must be in [0.0, 1.0] per the PDF spec).
 
 ### `#save(path)` → `nil`
 

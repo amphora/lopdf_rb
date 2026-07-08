@@ -1,5 +1,5 @@
 use lopdf::{Document, Object, ObjectId, Dictionary, Stream};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::geometry::{get_page_dimensions_or_fallback, resolve_x, resolve_y};
 use crate::metrics::text_width_pt;
@@ -41,7 +41,8 @@ struct StampItem {
     origin_x: String,       // "left" | "right" | "centre"
     origin_y: String,       // "top" | "bottom" | "middle"
     size: f64,
-    color: [f64; 3],        // RGB 0.0–1.0
+    #[serde(deserialize_with = "deserialize_rgb")]
+    color: [f64; 3],        // RGB 0.0–1.0, clamped at deserialization
     font: Option<String>,   // PDF base font name; defaults to Helvetica
     align: Option<String>,          // "left" | "centre" | "right"
     vertical_align: Option<String>, // "bottom" | "top" | "middle"
@@ -60,7 +61,7 @@ struct TextBlockItem {
     origin_y: String,
     #[serde(default = "default_font_size")]
     size: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_rgb")]
     color: [f64; 3],
     font: Option<String>,
     width: f64,
@@ -82,7 +83,7 @@ struct LineItem {
     x2_origin: String,
     #[serde(default = "default_bottom")]
     y2_origin: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_rgb")]
     color: [f64; 3],
     #[serde(default = "default_thickness")]
     thickness: f64,
@@ -103,7 +104,7 @@ struct RectangleItem {
     x2_origin: String,
     #[serde(default = "default_bottom")]
     y2_origin: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_rgb")]
     color: [f64; 3],
     #[serde(default = "default_thickness")]
     thickness: f64,
@@ -114,12 +115,44 @@ fn default_bottom() -> String { "bottom".to_string() }
 fn default_font_size() -> f64 { 12.0 }
 fn default_thickness() -> f64 { 0.5 }
 
+/// Clamp a colour channel into the [0.0, 1.0] range DeviceRGB operands
+/// require (ISO 32000 §8.6.4.2). Out-of-range channels are corrected
+/// silently, consistent with the crate's silent-correction convention
+/// (unknown fonts fall back to Helvetica, unknown origins fall through to
+/// defaults). The `+ 0.0` normalizes IEEE-754 negative zero to positive
+/// zero — `-0.0` is inside the clamp range but would Display as "-0" in
+/// the content stream. Channels are always finite here: the config arrives
+/// as JSON, which cannot encode NaN/Infinity.
+fn clamp_unit_channel(v: f64) -> f64 {
+    v.clamp(0.0, 1.0) + 0.0
+}
+
+/// Deserialize an RGB triple, normalizing every channel via
+/// `clamp_unit_channel`. Applied to each colour field on the stamp item
+/// structs so the stored values are safe to interpolate into content
+/// streams by construction — a future write site cannot reintroduce
+/// out-of-range operands by formatting the raw field.
+fn deserialize_rgb<'de, D>(deserializer: D) -> Result<[f64; 3], D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let channels = <[f64; 3]>::deserialize(deserializer)?;
+    Ok(channels.map(clamp_unit_channel))
+}
+
 /// Apply stamp config to every page in the document.
 ///
 /// Iterates all pages, reads each page's dimensions from MediaBox,
 /// resolves origin-relative coordinates, and appends a content stream
 /// with the stamp text.
-pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) {
+///
+/// Returns `Err` when a page's font registration or content-stream append
+/// fails. The first failure aborts the loop: earlier pages remain stamped,
+/// and the failing page itself may already be partially mutated (fonts
+/// registered in its /Resources by earlier items, orphaned font/stream
+/// objects added) — callers must discard the document on error rather than
+/// save it.
+pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) -> Result<(), String> {
     // Collect (page number, page ID) pairs so we can mutate doc afterwards —
     // get_pages() returns a BTreeMap, so iteration is already sorted by the
     // 1-based physical page number.
@@ -130,7 +163,7 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) {
 
     // If no pages, nothing to do
     if page_ids.is_empty() {
-        return;
+        return Ok(());
     }
 
     // Read dimensions for each page before mutating
@@ -138,8 +171,9 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) {
         .map(|&(page_number, pid)| get_page_dimensions_or_fallback(doc, pid, page_number))
         .collect();
 
-    for (i, &(_, page_id)) in page_ids.iter().enumerate() {
-        let (page_width, page_height) = dimensions[i];
+    for (&(page_number, page_id), &(page_width, page_height)) in
+        page_ids.iter().zip(dimensions.iter())
+    {
 
         // Build content stream for all stamp items on this page.
         // Render order: lines/rectangles first (background), then text on top.
@@ -181,7 +215,8 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) {
 
         for item in &config.stamps {
             let base_font = resolve_base_font(&item.font);
-            let font_name = ensure_font(doc, page_id, base_font);
+            let font_name = ensure_font(doc, page_id, base_font)
+                .map_err(|e| format!("page {page_number}: {e}"))?;
 
             let mut abs_x = resolve_x(item.x, &item.origin_x, page_width);
             let mut abs_y = resolve_y(item.y, &item.origin_y, page_height);
@@ -227,7 +262,8 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) {
         // Render text blocks (word-wrapped)
         for block in &config.text_blocks {
             let base_font = resolve_base_font(&block.font);
-            let font_name = ensure_font(doc, page_id, base_font);
+            let font_name = ensure_font(doc, page_id, base_font)
+                .map_err(|e| format!("page {page_number}: {e}"))?;
 
             let abs_x = resolve_x(block.x, &block.origin_x, page_width);
             let abs_y = resolve_y(block.y, &block.origin_y, page_height);
@@ -261,8 +297,11 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) {
         // Snapshot existing Contents (immutable borrow) before mutating,
         // because direct Stream objects need to be cloned and added as
         // indirect objects to avoid borrow conflicts.
-        append_content_stream(doc, page_id, stamp_id);
+        append_content_stream(doc, page_id, stamp_id)
+            .map_err(|e| format!("page {page_number}: {e}"))?;
     }
+
+    Ok(())
 }
 
 /// Word-wrap text to fit within `max_width` points.
@@ -307,6 +346,21 @@ fn wrap_text(text: &str, base_font: &str, font_size: f64, max_width: f64) -> Vec
     lines
 }
 
+/// Resolve an object id to its mutable dictionary for a content-stream
+/// write, failing with `"<action>: <lopdf error>"`. Covers both failure
+/// shapes the old silent `if let Ok(Object::Dictionary(...))` guards
+/// swallowed: `get_object_mut` errors and ok-but-not-a-Dictionary objects.
+/// The action closure is only evaluated on the error path.
+fn require_dict_mut<'a>(
+    doc: &'a mut Document,
+    id: ObjectId,
+    action: impl FnOnce() -> String,
+) -> Result<&'a mut Dictionary, String> {
+    doc.get_object_mut(id)
+        .and_then(Object::as_dict_mut)
+        .map_err(|e| format!("{}: {}", action(), e))
+}
+
 /// Escape special characters for a PDF text string (parenthesised literal).
 fn escape_pdf_text(text: &str) -> String {
     text.replace('\\', "\\\\")
@@ -321,7 +375,13 @@ fn escape_pdf_text(text: &str) -> String {
 /// /Contents can be a Reference (to a Stream or Array), a direct Array,
 /// a direct Stream, or absent. References are dereferenced to determine
 /// the target type (ISO 32000 §7.7.3.3).
-fn append_content_stream(doc: &mut Document, page_id: ObjectId, stamp_id: ObjectId) {
+///
+/// Returns `Err` when the page dictionary cannot be accessed for mutation —
+/// the stamp stream (and, when the original /Contents was a direct stream,
+/// its promoted indirect copy) has already been added as an object at that
+/// point but is wired into no /Contents, so the caller must treat the
+/// document as broken rather than saved-with-a-missing-stamp.
+fn append_content_stream(doc: &mut Document, page_id: ObjectId, stamp_id: ObjectId) -> Result<(), String> {
     // Snapshot the existing Contents with an immutable borrow.
     // References are dereferenced to distinguish stream vs array targets.
     enum ContentsKind {
@@ -356,31 +416,34 @@ fn append_content_stream(doc: &mut Document, page_id: ObjectId, stamp_id: Object
     };
 
     // Now mutate the page dict
-    if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
-        match kind {
-            ContentsKind::RefStream(existing_ref) => {
+    let page_dict = require_dict_mut(doc, page_id, || {
+        "cannot append stamp content stream to the page".to_string()
+    })?;
+    match kind {
+        ContentsKind::RefStream(existing_ref) => {
+            page_dict.set("Contents", Object::Array(vec![
+                Object::Reference(existing_ref),
+                Object::Reference(stamp_id),
+            ]));
+        }
+        ContentsKind::RefArray(mut existing_arr) | ContentsKind::Array(mut existing_arr) => {
+            existing_arr.push(Object::Reference(stamp_id));
+            page_dict.set("Contents", Object::Array(existing_arr));
+        }
+        ContentsKind::Stream(_) => {
+            if let Some(existing_id) = promoted_id {
                 page_dict.set("Contents", Object::Array(vec![
-                    Object::Reference(existing_ref),
+                    Object::Reference(existing_id),
                     Object::Reference(stamp_id),
                 ]));
             }
-            ContentsKind::RefArray(mut existing_arr) | ContentsKind::Array(mut existing_arr) => {
-                existing_arr.push(Object::Reference(stamp_id));
-                page_dict.set("Contents", Object::Array(existing_arr));
-            }
-            ContentsKind::Stream(_) => {
-                if let Some(existing_id) = promoted_id {
-                    page_dict.set("Contents", Object::Array(vec![
-                        Object::Reference(existing_id),
-                        Object::Reference(stamp_id),
-                    ]));
-                }
-            }
-            ContentsKind::Empty => {
-                page_dict.set("Contents", Object::Array(vec![Object::Reference(stamp_id)]));
-            }
+        }
+        ContentsKind::Empty => {
+            page_dict.set("Contents", Object::Array(vec![Object::Reference(stamp_id)]));
         }
     }
+
+    Ok(())
 }
 
 /// Validate and resolve the font name. Returns a standard PDF base font name,
@@ -396,7 +459,14 @@ fn resolve_base_font(font: &Option<String>) -> &str {
 /// Ensure the requested base font exists in the page's /Resources, walking
 /// the /Parent chain for inherited Resources. Returns the font's resource name
 /// (e.g. "F_PS_Helvetica") for use in content stream Tf operators.
-fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> String {
+///
+/// Returns `Err` when the page or its /Resources cannot be accessed for
+/// mutation — a swallowed failure here would leave content streams
+/// referencing a font that was never registered, which renders blank.
+/// On `Err` the freshly created font object has already been added to the
+/// document but is wired into no /Resources — an orphan, harmless because
+/// callers discard the document on error (see `apply_stamp_config`).
+fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> Result<String, String> {
     // Phase 1: Walk /Parent chain to find /Resources (inheritable per ISO 32000).
     // Snapshot the location so we can mutate afterwards without borrow conflicts.
     enum ResourcesLocation {
@@ -448,7 +518,7 @@ fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> String
     }
 
     if let Some(name) = existing_name {
-        return name;
+        return Ok(name);
     }
 
     // Phase 2: Font not found — add it
@@ -460,35 +530,42 @@ fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> String
     font_dict.set("BaseFont", Object::Name(base_font.as_bytes().to_vec()));
     let font_id = doc.add_object(font_dict);
 
+    // The page-identity ("page 3") context is supplied by apply_stamp_config's
+    // wrap — these messages name only the font and the object being written,
+    // so a composed error carries a single page reference.
+    let page_ctx = || format!("cannot register font {base_font} on the page");
+
     match location {
         ResourcesLocation::IndirectOnLeaf(res_id) => {
-            if let Ok(Object::Dictionary(ref mut resources)) = doc.get_object_mut(res_id) {
-                add_font_to_resources(resources, &font_name, font_id);
-            }
+            let resources = require_dict_mut(doc, res_id, || {
+                format!("cannot register font {base_font} in /Resources {res_id:?}")
+            })?;
+            add_font_to_resources(resources, &font_name, font_id);
         }
         ResourcesLocation::DirectOnLeaf => {
-            if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
-                if let Ok(Object::Dictionary(ref mut resources)) = page_dict.get_mut(b"Resources") {
-                    add_font_to_resources(resources, &font_name, font_id);
-                }
-            }
+            let page_dict = require_dict_mut(doc, page_id, page_ctx)?;
+            let resources = page_dict
+                .get_mut(b"Resources")
+                .and_then(Object::as_dict_mut)
+                .map_err(|e| {
+                    format!("cannot register font {base_font} in the page's direct /Resources: {e}")
+                })?;
+            add_font_to_resources(resources, &font_name, font_id);
         }
         ResourcesLocation::Inherited(mut inherited) => {
             add_font_to_resources(&mut inherited, &font_name, font_id);
-            if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
-                page_dict.set("Resources", Object::Dictionary(inherited));
-            }
+            let page_dict = require_dict_mut(doc, page_id, page_ctx)?;
+            page_dict.set("Resources", Object::Dictionary(inherited));
         }
         ResourcesLocation::Missing => {
-            if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
-                let mut resources = Dictionary::new();
-                add_font_to_resources(&mut resources, &font_name, font_id);
-                page_dict.set("Resources", Object::Dictionary(resources));
-            }
+            let page_dict = require_dict_mut(doc, page_id, page_ctx)?;
+            let mut resources = Dictionary::new();
+            add_font_to_resources(&mut resources, &font_name, font_id);
+            page_dict.set("Resources", Object::Dictionary(resources));
         }
     }
 
-    font_name
+    Ok(font_name)
 }
 
 /// Search for an existing font with the given BaseFont name in a Resources dictionary.
@@ -523,6 +600,56 @@ fn add_font_to_resources(resources: &mut Dictionary, font_name: &str, font_id: O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn us_letter_box() -> Vec<Object> {
+        vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(612),
+            Object::Integer(792),
+        ]
+    }
+
+    /// Build an `n`-page PDF for content-stream tests, mirroring the fixture
+    /// helpers in the sibling test modules (document.rs, annotation.rs,
+    /// manipulation.rs). `media_box: None` omits the MediaBox entirely so
+    /// the US Letter fallback path can be exercised. Returns the document
+    /// and the page ids in physical order.
+    fn build_test_pdf(page_count: usize, media_box: Option<Vec<Object>>) -> (Document, Vec<ObjectId>) {
+        let mut doc = Document::new();
+        let pages_id = doc.new_object_id();
+
+        let mut page_ids = Vec::new();
+        let mut kids = Vec::new();
+        for _ in 0..page_count {
+            let content_id = doc.add_object(Stream::new(Dictionary::new(), Vec::new()));
+
+            let mut page_dict = Dictionary::new();
+            page_dict.set("Type", Object::Name(b"Page".to_vec()));
+            page_dict.set("Parent", Object::Reference(pages_id));
+            if let Some(ref mb) = media_box {
+                page_dict.set("MediaBox", Object::Array(mb.clone()));
+            }
+            page_dict.set("Contents", Object::Reference(content_id));
+            let page_id = doc.add_object(page_dict);
+            page_ids.push(page_id);
+            kids.push(Object::Reference(page_id));
+        }
+
+        let mut pages_dict = Dictionary::new();
+        pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
+        pages_dict.set("Kids", Object::Array(kids));
+        pages_dict.set("Count", Object::Integer(page_count as i64));
+        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
+
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+        catalog.set("Pages", Object::Reference(pages_id));
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        (doc, page_ids)
+    }
 
     #[test]
     fn escape_pdf_text_special_chars() {
@@ -576,6 +703,23 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_rgb_clamps_and_normalizes_channels() {
+        let json = r#"{"x1": 0, "y1": 0, "x2": 1, "y2": 1, "color": [1.5, -0.25, 0.5]}"#;
+        let line: LineItem = serde_json::from_str(json).unwrap();
+        assert_eq!(line.color, [1.0, 0.0, 0.5]);
+
+        // In-range channels pass through unchanged; negative zero is
+        // normalized to +0.0 (it compares equal, so assert the sign bit).
+        let json = r#"{"x1": 0, "y1": 0, "x2": 1, "y2": 1, "color": [-0.0, 0.42, 1.0]}"#;
+        let line: LineItem = serde_json::from_str(json).unwrap();
+        assert_eq!(line.color, [0.0, 0.42, 1.0]);
+        assert!(
+            line.color[0].is_sign_positive(),
+            "negative zero should be normalized to +0.0"
+        );
+    }
+
+    #[test]
     fn deserialize_line_defaults() {
         let json = r#"{"x1": 10, "y1": 20, "x2": 300, "y2": 400}"#;
         let line: LineItem = serde_json::from_str(json).unwrap();
@@ -624,41 +768,11 @@ mod tests {
 
     #[test]
     fn test_apply_stamp_config_renders_on_all_pages() {
-        let mut doc = Document::new();
-        let pages_id = doc.new_object_id();
-
-        let mut kids = Vec::new();
-        for _ in 0..2 {
-            let content_stream = Stream::new(Dictionary::new(), Vec::new());
-            let content_id = doc.add_object(content_stream);
-
-            let mut page_dict = Dictionary::new();
-            page_dict.set("Type", Object::Name(b"Page".to_vec()));
-            page_dict.set("Parent", Object::Reference(pages_id));
-            page_dict.set("MediaBox", Object::Array(vec![
-                Object::Integer(0), Object::Integer(0),
-                Object::Integer(612), Object::Integer(792),
-            ]));
-            page_dict.set("Contents", Object::Reference(content_id));
-            let page_id = doc.add_object(page_dict);
-            kids.push(Object::Reference(page_id));
-        }
-
-        let mut pages_dict = Dictionary::new();
-        pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
-        pages_dict.set("Kids", Object::Array(kids.clone()));
-        pages_dict.set("Count", Object::Integer(2));
-        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
-
-        let mut catalog = Dictionary::new();
-        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
-        catalog.set("Pages", Object::Reference(pages_id));
-        let catalog_id = doc.add_object(catalog);
-        doc.trailer.set("Root", Object::Reference(catalog_id));
+        let (mut doc, _page_ids) = build_test_pdf(2, Some(us_letter_box()));
 
         let json = r#"{"stamps": [{"text": "VIEWED", "x": 10, "y": 10, "origin_x": "left", "origin_y": "bottom", "size": 12, "color": [0.5, 0.5, 0.5]}]}"#;
         let config: StampConfig = serde_json::from_str(json).unwrap();
-        apply_stamp_config(&mut doc, &config);
+        apply_stamp_config(&mut doc, &config).expect("stamping should succeed");
 
         // Each page should now have a /Contents array with 2 elements (original + stamp)
         let pages = doc.get_pages();
@@ -679,33 +793,14 @@ mod tests {
         // against the US Letter fallback (612x792) rather than skipping the
         // page or using zero-collapsed dimensions. Pins the value of
         // geometry::US_LETTER_FALLBACK end-to-end through a real call site.
-        let mut doc = Document::new();
-        let pages_id = doc.new_object_id();
-
-        let content_id = doc.add_object(Stream::new(Dictionary::new(), Vec::new()));
-        let mut page_dict = Dictionary::new();
-        page_dict.set("Type", Object::Name(b"Page".to_vec()));
-        page_dict.set("Parent", Object::Reference(pages_id));
-        page_dict.set("Contents", Object::Reference(content_id));
-        let page_id = doc.add_object(page_dict);
-
-        let mut pages_dict = Dictionary::new();
-        pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
-        pages_dict.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
-        pages_dict.set("Count", Object::Integer(1));
-        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
-
-        let mut catalog = Dictionary::new();
-        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
-        catalog.set("Pages", Object::Reference(pages_id));
-        let catalog_id = doc.add_object(catalog);
-        doc.trailer.set("Root", Object::Reference(catalog_id));
+        let (mut doc, page_ids) = build_test_pdf(1, None);
+        let page_id = page_ids[0];
 
         // A line starting at (0 from right, 0 from top): with the fallback
         // dimensions the start point resolves to exactly (612, 792).
         let json = r#"{"lines": [{"x1": 0, "y1": 0, "x2": 0, "y2": 0, "x1_origin": "right", "y1_origin": "top"}]}"#;
         let config: StampConfig = serde_json::from_str(json).unwrap();
-        apply_stamp_config(&mut doc, &config);
+        apply_stamp_config(&mut doc, &config).expect("stamping should succeed");
 
         let page = match doc.get_object(page_id) {
             Ok(Object::Dictionary(ref d)) => d.clone(),
@@ -729,36 +824,123 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_stamp_config_renders_text_block_with_line_spacing() {
+        // Courier is fixed-pitch: every glyph is 600 units = 6 pt/char at
+        // size 10. "aaaa bbbb" = 24 + 6 + 24 = 54 pt <= 70; adding " cccc"
+        // -> 84 pt > 70, so the block wraps to exactly two lines.
+        let (mut doc, page_ids) = build_test_pdf(1, Some(us_letter_box()));
+        let page_id = page_ids[0];
+
+        let json = r#"{"text_blocks": [{"text": "aaaa bbbb cccc", "x": 50, "y": 700, "width": 70, "size": 10, "font": "Courier", "line_spacing": 14}]}"#;
+        let config: StampConfig = serde_json::from_str(json).unwrap();
+        apply_stamp_config(&mut doc, &config).expect("stamping should succeed");
+
+        let contents = match doc.get_object(page_id) {
+            Ok(Object::Dictionary(ref d)) => match d.get(b"Contents") {
+                Ok(Object::Array(ref a)) => a.clone(),
+                other => panic!("expected /Contents array after stamping, got {:?}", other),
+            },
+            other => panic!("expected page dictionary, got {:?}", other),
+        };
+        assert_eq!(contents.len(), 2, "Page should have original + stamp content streams");
+
+        let stamp_ref = contents[1].as_reference().unwrap();
+        let content = match doc.get_object(stamp_ref) {
+            Ok(Object::Stream(ref s)) => String::from_utf8_lossy(&s.content).into_owned(),
+            other => panic!("expected stamp stream, got {:?}", other),
+        };
+
+        // Text-showing structure and font selection
+        assert!(content.contains("BT"), "should open a text object, got: {content}");
+        assert!(content.contains("ET"), "should close the text object, got: {content}");
+        assert!(
+            content.contains("/F_PS_Courier 10 Tf"),
+            "should select the registered font, got: {content}"
+        );
+
+        // The /Tf reference is registered, not dangling:
+        // /Resources -> /Font -> F_PS_Courier on the page
+        let resources = match doc.get_object(page_id) {
+            Ok(Object::Dictionary(ref d)) => match d.get(b"Resources") {
+                Ok(Object::Dictionary(ref r)) => r.clone(),
+                other => panic!("expected direct /Resources dictionary, got {:?}", other),
+            },
+            other => panic!("expected page dictionary, got {:?}", other),
+        };
+        match resources.get(b"Font") {
+            Ok(Object::Dictionary(ref fonts)) => assert!(
+                fonts.get(b"F_PS_Courier").is_ok(),
+                "F_PS_Courier should be registered in /Resources"
+            ),
+            other => panic!("expected /Font dictionary in /Resources, got {:?}", other),
+        }
+
+        // Wrapped lines step down by exactly line_spacing: 700, then
+        // 700 - 14 = 686. If line_spacing were ignored (the 0-spacing
+        // overlap failure) both lines would land at y=700 and the second
+        // assertion would fail — the test cannot pass vacuously.
+        assert!(
+            content.contains("50 700 Td (aaaa bbbb) Tj"),
+            "first wrapped line should sit at the block origin, got: {content}"
+        );
+        assert!(
+            content.contains("50 686 Td (cccc) Tj"),
+            "second wrapped line should sit one line_spacing below, got: {content}"
+        );
+    }
+
+    #[test]
+    fn test_apply_stamp_config_clamps_rgb_in_content_stream() {
+        // Out-of-range channels must be clamped into DeviceRGB's [0.0, 1.0]
+        // before reaching the content stream, covering both a stroke
+        // (RG, line) and a fill (rg, stamp text) operator, plus negative
+        // zero (in-range for clamp, but would emit "-0" unnormalized).
+        let (mut doc, page_ids) = build_test_pdf(1, Some(us_letter_box()));
+        let page_id = page_ids[0];
+
+        let json = r#"{
+            "stamps": [{"text": "X", "x": 10, "y": 10, "origin_x": "left", "origin_y": "bottom", "size": 12, "color": [1.5, -0.25, 0.5]}],
+            "lines": [{"x1": 0, "y1": 0, "x2": 100, "y2": 0, "color": [-0.0, -0.25, 0.5]}]
+        }"#;
+        let config: StampConfig = serde_json::from_str(json).unwrap();
+        apply_stamp_config(&mut doc, &config).expect("stamping should succeed");
+
+        let contents = match doc.get_object(page_id) {
+            Ok(Object::Dictionary(ref d)) => match d.get(b"Contents") {
+                Ok(Object::Array(ref a)) => a.clone(),
+                other => panic!("expected /Contents array after stamping, got {:?}", other),
+            },
+            other => panic!("expected page dictionary, got {:?}", other),
+        };
+        assert_eq!(contents.len(), 2, "Page should have original + stamp content streams");
+
+        let stamp_ref = contents[1].as_reference().unwrap();
+        let content = match doc.get_object(stamp_ref) {
+            Ok(Object::Stream(ref s)) => String::from_utf8_lossy(&s.content).into_owned(),
+            other => panic!("expected stamp stream, got {:?}", other),
+        };
+
+        assert!(
+            content.contains("0 0 0.5 RG"),
+            "line stroke colour should be clamped and sign-normalized, got: {content}"
+        );
+        assert!(
+            content.contains("1 0 0.5 rg"),
+            "stamp fill colour should be clamped, got: {content}"
+        );
+        assert!(
+            !content.contains("1.5") && !content.contains("-0"),
+            "unclamped or negative-zero channel values must never reach the output, got: {content}"
+        );
+    }
+
+    #[test]
     fn test_ensure_font_adds_to_resources() {
-        let mut doc = Document::new();
-        let pages_id = doc.new_object_id();
+        let (mut doc, page_ids) = build_test_pdf(1, Some(us_letter_box()));
+        let page_id = page_ids[0];
 
-        let content_stream = Stream::new(Dictionary::new(), Vec::new());
-        let content_id = doc.add_object(content_stream);
-
-        let mut page_dict = Dictionary::new();
-        page_dict.set("Type", Object::Name(b"Page".to_vec()));
-        page_dict.set("Parent", Object::Reference(pages_id));
-        page_dict.set("MediaBox", Object::Array(vec![
-            Object::Integer(0), Object::Integer(0),
-            Object::Integer(612), Object::Integer(792),
-        ]));
-        page_dict.set("Contents", Object::Reference(content_id));
-        let page_id = doc.add_object(page_dict);
-
-        let mut pages_dict = Dictionary::new();
-        pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
-        pages_dict.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
-        pages_dict.set("Count", Object::Integer(1));
-        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
-
-        let mut catalog = Dictionary::new();
-        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
-        catalog.set("Pages", Object::Reference(pages_id));
-        let catalog_id = doc.add_object(catalog);
-        doc.trailer.set("Root", Object::Reference(catalog_id));
-
-        let font_name = ensure_font(&mut doc, page_id, "Helvetica");
+        let font_name = ensure_font(&mut doc, page_id, "Helvetica")
+            .expect("font registration should succeed");
         assert_eq!(font_name, "F_PS_Helvetica");
 
         // Verify font was added to page resources
@@ -771,5 +953,41 @@ mod tests {
             }
         }
         panic!("Font not found in page resources");
+    }
+
+    #[test]
+    fn test_ensure_font_errors_when_page_unresolvable() {
+        // Unreachable through apply_stamp_config (get_pages only yields
+        // dictionary-resolvable ids) — called directly, as metadata.rs's
+        // error-path tests do. Pins the Err contract so a regression back
+        // to the old silent-skip guards cannot pass unnoticed.
+        let mut doc = Document::new();
+        let err = ensure_font(&mut doc, (9999, 0), "Helvetica")
+            .expect_err("a dangling page id must fail font registration");
+        assert!(
+            err.contains("cannot register font Helvetica"),
+            "unexpected error message: {err}"
+        );
+
+        // The ok-but-not-a-Dictionary shape (as_dict_mut failure).
+        let int_id = doc.add_object(Object::Integer(7));
+        let err = ensure_font(&mut doc, int_id, "Courier")
+            .expect_err("a non-dictionary page object must fail font registration");
+        assert!(
+            err.contains("cannot register font Courier"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_append_content_stream_errors_when_page_unresolvable() {
+        let mut doc = Document::new();
+        let stamp_id = doc.add_object(Stream::new(Dictionary::new(), Vec::new()));
+        let err = append_content_stream(&mut doc, (9999, 0), stamp_id)
+            .expect_err("a dangling page id must fail the content-stream append");
+        assert!(
+            err.contains("cannot append stamp content stream"),
+            "unexpected error message: {err}"
+        );
     }
 }
