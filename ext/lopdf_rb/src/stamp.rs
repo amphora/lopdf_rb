@@ -656,16 +656,25 @@ fn find_font_in_resources(doc: &Document, resources: &Dictionary, base_font: &st
 }
 
 /// Search a /Font dictionary for an entry with the given BaseFont name.
+/// Entries may be indirect References or direct dictionaries (ISO 32000
+/// §7.8.3 permits both). An entry Reference that does not resolve to a
+/// dictionary is skipped — "not found" is the right answer for a lookup,
+/// and this function never becomes a write target (unlike the /Resources
+/// and /Font container references, whose registration paths error).
 fn find_base_font_in(doc: &Document, fonts: &Dictionary, base_font: &str) -> Option<String> {
     let target = base_font.as_bytes();
-    for (name, font_ref) in fonts.iter() {
-        if let Object::Reference(fref) = font_ref {
-            if let Ok(Object::Dictionary(ref font_dict)) = doc.get_object(*fref) {
-                if let Ok(Object::Name(ref bf)) = font_dict.get(b"BaseFont") {
-                    if bf == target {
-                        return Some(String::from_utf8_lossy(name).to_string());
-                    }
-                }
+    for (name, entry) in fonts.iter() {
+        let font_dict = match entry {
+            Object::Reference(fref) => match doc.get_object(*fref) {
+                Ok(Object::Dictionary(ref d)) => d,
+                _ => continue,
+            },
+            Object::Dictionary(ref d) => d,
+            _ => continue,
+        };
+        if let Ok(Object::Name(ref bf)) = font_dict.get(b"BaseFont") {
+            if bf == target {
+                return Some(String::from_utf8_lossy(name).to_string());
             }
         }
     }
@@ -1141,6 +1150,48 @@ mod tests {
             object_count,
             "a lookup hit should not add objects or re-register the font"
         );
+    }
+
+    #[test]
+    fn test_ensure_font_finds_direct_dict_font_entry() {
+        // A font stored as a direct dictionary inside /Font (legal per
+        // ISO 32000 §7.8.3) was invisible to the Reference-only lookup,
+        // so every stamp pass registered a duplicate F_PS_* object.
+        let (mut doc, page_ids) = build_test_pdf(1, Some(us_letter_box()));
+        let page_id = page_ids[0];
+
+        let mut font = Dictionary::new();
+        font.set("Type", Object::Name(b"Font".to_vec()));
+        font.set("Subtype", Object::Name(b"Type1".to_vec()));
+        font.set("BaseFont", Object::Name(b"Times-Roman".to_vec()));
+        let mut fonts = Dictionary::new();
+        fonts.set("TR7", Object::Dictionary(font));
+        set_page_font(&mut doc, page_id, Object::Dictionary(fonts));
+        let object_count = doc.objects.len();
+
+        let font_name = ensure_font(&mut doc, page_id, "Times-Roman")
+            .expect("lookup of a direct-dict font entry should succeed");
+
+        assert_eq!(font_name, "TR7", "existing direct-dict entry should be reused");
+        assert_eq!(
+            doc.objects.len(),
+            object_count,
+            "a lookup hit should not add objects or re-register the font"
+        );
+        match doc.get_object(page_id) {
+            Ok(Object::Dictionary(ref page_dict)) => match page_dict.get(b"Resources") {
+                Ok(Object::Dictionary(ref resources)) => match resources.get(b"Font") {
+                    Ok(Object::Dictionary(ref fonts)) => assert_eq!(
+                        fonts.len(),
+                        1,
+                        "no duplicate entry should be registered alongside TR7"
+                    ),
+                    other => panic!("expected direct /Font dict, got {other:?}"),
+                },
+                other => panic!("expected direct /Resources, got {other:?}"),
+            },
+            other => panic!("expected page dictionary, got {other:?}"),
+        }
     }
 
     #[test]
