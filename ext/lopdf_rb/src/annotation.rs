@@ -1,5 +1,15 @@
 use lopdf::{Document, Object, ObjectId, Dictionary, StringFormat};
 
+/// Embed an invisible FreeText annotation carrying `dlp_data` on the last
+/// page of the document.
+///
+/// The annotation is Hidden + NoView (F=34) so it never renders; `dlp_data`
+/// (typically a JSON blob with reader/document metadata) becomes its
+/// /Contents. Errors when the PDF has no pages, or when [`add_to_annots`]
+/// cannot wire the annotation into the page — in that case the
+/// already-inserted annotation object is left orphaned in `doc.objects`
+/// (harmless: the caller is expected to discard the document on error, as
+/// the Rails `PdfStamper` does).
 pub(crate) fn add_invisible_annotation(doc: &mut Document, dlp_data: &str) -> Result<(), String> {
     let pages = doc.get_pages();
     let last_page_id = *pages.values().last()
@@ -22,13 +32,23 @@ pub(crate) fn add_invisible_annotation(doc: &mut Document, dlp_data: &str) -> Re
 
     // Add annotation reference to the page's /Annots array.
     // /Annots can be a direct Array or an indirect Reference to an Array.
-    add_to_annots(doc, last_page_id, annot_id);
+    add_to_annots(doc, last_page_id, annot_id)?;
 
     Ok(())
 }
 
-fn add_to_annots(doc: &mut Document, page_id: ObjectId, annot_id: ObjectId) {
-    // First, check if /Annots is an indirect reference and resolve it
+/// Append `annot_id` to the page's /Annots array, which may be a direct
+/// array in the page dictionary or an indirect reference to an array object.
+///
+/// Errors when the page object cannot be resolved or is not a dictionary,
+/// and when an indirect /Annots reference does not resolve to an array —
+/// falling through to the direct path there would overwrite the reference
+/// with a fresh array and silently discard every pre-existing annotation.
+/// On `Err` the caller's already-inserted annotation object is left unwired.
+fn add_to_annots(doc: &mut Document, page_id: ObjectId, annot_id: ObjectId) -> Result<(), String> {
+    // First, check if /Annots is an indirect reference and resolve it.
+    // A page object that fails this read-only pass falls through to the
+    // direct path below, where the mutable access reports the failure.
     let annots_ref_id = if let Ok(Object::Dictionary(ref page_dict)) = doc.get_object(page_id) {
         if let Ok(Object::Reference(ref_id)) = page_dict.get(b"Annots") {
             Some(*ref_id)
@@ -41,22 +61,37 @@ fn add_to_annots(doc: &mut Document, page_id: ObjectId, annot_id: ObjectId) {
 
     if let Some(ref_id) = annots_ref_id {
         // /Annots is indirect — append to the referenced array
-        if let Ok(Object::Array(ref mut annots)) = doc.get_object_mut(ref_id) {
-            annots.push(Object::Reference(annot_id));
-            return;
-        }
+        return match doc.get_object_mut(ref_id) {
+            Ok(Object::Array(ref mut annots)) => {
+                annots.push(Object::Reference(annot_id));
+                Ok(())
+            }
+            Ok(_) => Err(format!(
+                "/Annots reference {:?} on page {:?} does not resolve to an array",
+                ref_id, page_id
+            )),
+            Err(e) => Err(format!(
+                "failed to resolve /Annots reference {:?} on page {:?}: {}",
+                ref_id, page_id, e
+            )),
+        };
     }
 
     // /Annots is direct or missing — handle inline
-    if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
-        match page_dict.get_mut(b"Annots") {
-            Ok(Object::Array(ref mut annots)) => {
-                annots.push(Object::Reference(annot_id));
+    match doc.get_object_mut(page_id) {
+        Ok(Object::Dictionary(ref mut page_dict)) => {
+            match page_dict.get_mut(b"Annots") {
+                Ok(Object::Array(ref mut annots)) => {
+                    annots.push(Object::Reference(annot_id));
+                }
+                _ => {
+                    page_dict.set("Annots", Object::Array(vec![Object::Reference(annot_id)]));
+                }
             }
-            _ => {
-                page_dict.set("Annots", Object::Array(vec![Object::Reference(annot_id)]));
-            }
+            Ok(())
         }
+        Ok(_) => Err(format!("page object {:?} is not a dictionary", page_id)),
+        Err(e) => Err(format!("failed to resolve page object {:?}: {}", page_id, e)),
     }
 }
 
@@ -200,6 +235,51 @@ mod tests {
         } else {
             panic!("Page dictionary not found");
         }
+    }
+
+    #[test]
+    fn test_add_annotation_errors_when_indirect_annots_not_array() {
+        let mut doc = create_test_pdf(1);
+        let pages = doc.get_pages();
+        let page_id = *pages.values().next().unwrap();
+
+        // Malformed: /Annots is an indirect reference to a non-array
+        let bogus_id = doc.add_object(Object::Integer(42));
+        if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
+            page_dict.set("Annots", Object::Reference(bogus_id));
+        }
+
+        let err = add_invisible_annotation(&mut doc, "dlp-data")
+            .expect_err("should error when indirect /Annots is not an array");
+        assert!(err.contains("/Annots"), "error should name /Annots: {}", err);
+
+        // The malformed reference must be left untouched — not overwritten
+        // with a fresh direct array, which in the general case would discard
+        // every pre-existing annotation.
+        if let Ok(Object::Dictionary(ref page_dict)) = doc.get_object(page_id) {
+            assert_eq!(
+                page_dict.get(b"Annots").unwrap(),
+                &Object::Reference(bogus_id),
+                "/Annots reference should be preserved on error"
+            );
+        } else {
+            panic!("Page dictionary not found");
+        }
+    }
+
+    #[test]
+    fn test_add_to_annots_errors_on_dangling_page_object() {
+        // Unreachable through add_invisible_annotation (get_pages only
+        // yields resolvable dictionary ids) — call the helper directly to
+        // pin the Err contract, as metadata.rs's error-path tests do.
+        let mut doc = create_test_pdf(1);
+        let mut annot = Dictionary::new();
+        annot.set("Type", Object::Name(b"Annot".to_vec()));
+        let annot_id = doc.add_object(annot);
+
+        let err = add_to_annots(&mut doc, (9999, 0), annot_id)
+            .expect_err("should error on a dangling page object");
+        assert!(err.contains("page object"), "error should name the page object: {}", err);
     }
 
     #[test]

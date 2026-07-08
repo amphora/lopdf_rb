@@ -256,6 +256,12 @@ impl RbDocument {
     ///
     /// The annotation is invisible (Hidden + NoView flags) and contains the
     /// provided string as its /Contents. Typically a JSON blob with reader/document metadata.
+    ///
+    /// Raises `RuntimeError` when the PDF has no pages or the annotation
+    /// cannot be wired into the last page's /Annots (inaccessible page
+    /// dictionary, or an indirect /Annots that does not resolve to an
+    /// array) — the annotation object is orphaned in memory at that point
+    /// and the document must be discarded, not saved.
     fn add_dlp_annotation(&self, dlp_data: String) -> Result<(), Error> {
         crate::annotation::add_invisible_annotation(
             &mut self.inner.borrow_mut(),

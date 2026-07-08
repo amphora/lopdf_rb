@@ -80,7 +80,7 @@ Typically used to embed a JSON blob with reader/document metadata for DLP (Data 
 doc.add_dlp_annotation('{"reader":"Alex","documentId":"DOC-123","timestamp":"2026-03-16T11:00:00.000Z"}')
 ```
 
-Raises `RuntimeError` if the PDF has no pages.
+Raises `RuntimeError` if the PDF has no pages, if the last page's dictionary cannot be accessed, or if the page's `/Annots` is an indirect reference that does not resolve to an array (overwriting it would silently discard the page's existing annotations, so the operation fails instead).
 
 ### `#apply_visible_stamps(config)` → `nil`
 
