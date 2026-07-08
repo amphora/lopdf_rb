@@ -147,9 +147,11 @@ where
 /// with the stamp text.
 ///
 /// Returns `Err` when a page's font registration or content-stream append
-/// fails. The first failure aborts the loop, so earlier pages remain stamped
-/// in the in-memory document — callers must discard the document on error
-/// rather than save it.
+/// fails. The first failure aborts the loop: earlier pages remain stamped,
+/// and the failing page itself may already be partially mutated (fonts
+/// registered in its /Resources by earlier items, orphaned font/stream
+/// objects added) — callers must discard the document on error rather than
+/// save it.
 pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) -> Result<(), String> {
     // Collect (page number, page ID) pairs so we can mutate doc afterwards —
     // get_pages() returns a BTreeMap, so iteration is already sorted by the
@@ -169,8 +171,9 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) -> Re
         .map(|&(page_number, pid)| get_page_dimensions_or_fallback(doc, pid, page_number))
         .collect();
 
-    for (i, &(page_number, page_id)) in page_ids.iter().enumerate() {
-        let (page_width, page_height) = dimensions[i];
+    for (&(page_number, page_id), &(page_width, page_height)) in
+        page_ids.iter().zip(dimensions.iter())
+    {
 
         // Build content stream for all stamp items on this page.
         // Render order: lines/rectangles first (background), then text on top.
@@ -343,6 +346,21 @@ fn wrap_text(text: &str, base_font: &str, font_size: f64, max_width: f64) -> Vec
     lines
 }
 
+/// Resolve an object id to its mutable dictionary for a content-stream
+/// write, failing with `"<action>: <lopdf error>"`. Covers both failure
+/// shapes the old silent `if let Ok(Object::Dictionary(...))` guards
+/// swallowed: `get_object_mut` errors and ok-but-not-a-Dictionary objects.
+/// The action closure is only evaluated on the error path.
+fn require_dict_mut<'a>(
+    doc: &'a mut Document,
+    id: ObjectId,
+    action: impl FnOnce() -> String,
+) -> Result<&'a mut Dictionary, String> {
+    doc.get_object_mut(id)
+        .and_then(Object::as_dict_mut)
+        .map_err(|e| format!("{}: {}", action(), e))
+}
+
 /// Escape special characters for a PDF text string (parenthesised literal).
 fn escape_pdf_text(text: &str) -> String {
     text.replace('\\', "\\\\")
@@ -359,9 +377,10 @@ fn escape_pdf_text(text: &str) -> String {
 /// the target type (ISO 32000 §7.7.3.3).
 ///
 /// Returns `Err` when the page dictionary cannot be accessed for mutation —
-/// the stamp stream has already been added as an object at that point, but
-/// is not wired into any /Contents, so the caller must treat the document
-/// as broken rather than saved-with-a-missing-stamp.
+/// the stamp stream (and, when the original /Contents was a direct stream,
+/// its promoted indirect copy) has already been added as an object at that
+/// point but is wired into no /Contents, so the caller must treat the
+/// document as broken rather than saved-with-a-missing-stamp.
 fn append_content_stream(doc: &mut Document, page_id: ObjectId, stamp_id: ObjectId) -> Result<(), String> {
     // Snapshot the existing Contents with an immutable borrow.
     // References are dereferenced to distinguish stream vs array targets.
@@ -397,10 +416,9 @@ fn append_content_stream(doc: &mut Document, page_id: ObjectId, stamp_id: Object
     };
 
     // Now mutate the page dict
-    let page_dict = doc
-        .get_object_mut(page_id)
-        .and_then(Object::as_dict_mut)
-        .map_err(|e| format!("cannot append stamp content stream to page {:?}: {}", page_id, e))?;
+    let page_dict = require_dict_mut(doc, page_id, || {
+        "cannot append stamp content stream to the page".to_string()
+    })?;
     match kind {
         ContentsKind::RefStream(existing_ref) => {
             page_dict.set("Contents", Object::Array(vec![
@@ -445,6 +463,9 @@ fn resolve_base_font(font: &Option<String>) -> &str {
 /// Returns `Err` when the page or its /Resources cannot be accessed for
 /// mutation — a swallowed failure here would leave content streams
 /// referencing a font that was never registered, which renders blank.
+/// On `Err` the freshly created font object has already been added to the
+/// document but is wired into no /Resources — an orphan, harmless because
+/// callers discard the document on error (see `apply_stamp_config`).
 fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> Result<String, String> {
     // Phase 1: Walk /Parent chain to find /Resources (inheritable per ISO 32000).
     // Snapshot the location so we can mutate afterwards without borrow conflicts.
@@ -509,51 +530,35 @@ fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> Result
     font_dict.set("BaseFont", Object::Name(base_font.as_bytes().to_vec()));
     let font_id = doc.add_object(font_dict);
 
+    // The page-identity ("page 3") context is supplied by apply_stamp_config's
+    // wrap — these messages name only the font and the object being written,
+    // so a composed error carries a single page reference.
+    let page_ctx = || format!("cannot register font {base_font} on the page");
+
     match location {
         ResourcesLocation::IndirectOnLeaf(res_id) => {
-            let resources = doc
-                .get_object_mut(res_id)
-                .and_then(Object::as_dict_mut)
-                .map_err(|e| {
-                    format!("cannot register font {} in /Resources {:?}: {}", base_font, res_id, e)
-                })?;
+            let resources = require_dict_mut(doc, res_id, || {
+                format!("cannot register font {base_font} in /Resources {res_id:?}")
+            })?;
             add_font_to_resources(resources, &font_name, font_id);
         }
         ResourcesLocation::DirectOnLeaf => {
-            let page_dict = doc
-                .get_object_mut(page_id)
-                .and_then(Object::as_dict_mut)
-                .map_err(|e| {
-                    format!("cannot register font {} on page {:?}: {}", base_font, page_id, e)
-                })?;
+            let page_dict = require_dict_mut(doc, page_id, page_ctx)?;
             let resources = page_dict
                 .get_mut(b"Resources")
                 .and_then(Object::as_dict_mut)
                 .map_err(|e| {
-                    format!(
-                        "cannot register font {} in page {:?}'s direct /Resources: {}",
-                        base_font, page_id, e
-                    )
+                    format!("cannot register font {base_font} in the page's direct /Resources: {e}")
                 })?;
             add_font_to_resources(resources, &font_name, font_id);
         }
         ResourcesLocation::Inherited(mut inherited) => {
             add_font_to_resources(&mut inherited, &font_name, font_id);
-            let page_dict = doc
-                .get_object_mut(page_id)
-                .and_then(Object::as_dict_mut)
-                .map_err(|e| {
-                    format!("cannot register font {} on page {:?}: {}", base_font, page_id, e)
-                })?;
+            let page_dict = require_dict_mut(doc, page_id, page_ctx)?;
             page_dict.set("Resources", Object::Dictionary(inherited));
         }
         ResourcesLocation::Missing => {
-            let page_dict = doc
-                .get_object_mut(page_id)
-                .and_then(Object::as_dict_mut)
-                .map_err(|e| {
-                    format!("cannot register font {} on page {:?}: {}", base_font, page_id, e)
-                })?;
+            let page_dict = require_dict_mut(doc, page_id, page_ctx)?;
             let mut resources = Dictionary::new();
             add_font_to_resources(&mut resources, &font_name, font_id);
             page_dict.set("Resources", Object::Dictionary(resources));
