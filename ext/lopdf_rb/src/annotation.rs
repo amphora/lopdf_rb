@@ -160,6 +160,49 @@ mod tests {
     }
 
     #[test]
+    fn test_add_annotation_appends_to_indirect_annots() {
+        let mut doc = create_test_pdf(1);
+        let pages = doc.get_pages();
+        let page_id = *pages.values().next().unwrap();
+
+        // Pre-existing annotation held in a separately-inserted array that
+        // the page references indirectly — the other legal /Annots layout.
+        let mut existing_annot = Dictionary::new();
+        existing_annot.set("Type", Object::Name(b"Annot".to_vec()));
+        existing_annot.set("Subtype", Object::Name(b"Link".to_vec()));
+        let existing_id = doc.add_object(existing_annot);
+        let array_id = doc.add_object(Object::Array(vec![Object::Reference(existing_id)]));
+
+        if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
+            page_dict.set("Annots", Object::Reference(array_id));
+        }
+
+        add_invisible_annotation(&mut doc, "dlp-data").unwrap();
+
+        // The referenced array gains the new annotation alongside the existing one
+        match doc.get_object(array_id) {
+            Ok(Object::Array(ref annots)) => {
+                assert_eq!(annots.len(), 2, "Should have 2 annotations (existing + new)");
+                assert_eq!(annots[0], Object::Reference(existing_id));
+                assert!(matches!(annots[1], Object::Reference(_)), "new entry should be a reference");
+            }
+            other => panic!("/Annots array not found at its object id: {:?}", other),
+        }
+
+        // The page dictionary still holds the indirect reference — not a
+        // flattened direct array
+        if let Ok(Object::Dictionary(ref page_dict)) = doc.get_object(page_id) {
+            assert_eq!(
+                page_dict.get(b"Annots").unwrap(),
+                &Object::Reference(array_id),
+                "/Annots should remain an indirect reference"
+            );
+        } else {
+            panic!("Page dictionary not found");
+        }
+    }
+
+    #[test]
     fn test_add_annotation_appends_to_existing_annots() {
         let mut doc = create_test_pdf(1);
         let pages = doc.get_pages();
