@@ -157,8 +157,8 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) -> Re
             let abs_y2 = resolve_y(line.y2, &line.y2_origin, page_height);
 
             content_parts.push(format!(
-                "q {} {} {} RG {} w {} {} m {} {} l S Q",
-                line.color[0], line.color[1], line.color[2],
+                "q {} RG {} w {} {} m {} {} l S Q",
+                clamped_rgb(&line.color),
                 line.thickness,
                 abs_x1, abs_y1,
                 abs_x2, abs_y2
@@ -177,8 +177,8 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) -> Re
             let rh = (abs_y2 - abs_y1).abs();
 
             content_parts.push(format!(
-                "q {} {} {} RG {} w {} {} {} {} re S Q",
-                rect.color[0], rect.color[1], rect.color[2],
+                "q {} RG {} w {} {} {} {} re S Q",
+                clamped_rgb(&rect.color),
                 rect.thickness,
                 rx, ry, rw, rh
             ));
@@ -222,8 +222,8 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) -> Re
             };
 
             content_parts.push(format!(
-                "q {} {} {} rg BT /{} {} Tf {} ({}) Tj ET Q",
-                item.color[0], item.color[1], item.color[2],
+                "q {} rg BT /{} {} Tf {} ({}) Tj ET Q",
+                clamped_rgb(&item.color),
                 font_name, item.size,
                 position_op,
                 escape_pdf_text(&item.text)
@@ -244,8 +244,8 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) -> Re
             for (line_idx, line) in lines.iter().enumerate() {
                 let line_y = abs_y - (line_idx as f64 * block.line_spacing);
                 content_parts.push(format!(
-                    "q {} {} {} rg BT /{} {} Tf {} {} Td ({}) Tj ET Q",
-                    block.color[0], block.color[1], block.color[2],
+                    "q {} rg BT /{} {} Tf {} {} Td ({}) Tj ET Q",
+                    clamped_rgb(&block.color),
                     font_name, block.size,
                     abs_x, line_y,
                     escape_pdf_text(line)
@@ -315,6 +315,22 @@ fn wrap_text(text: &str, base_font: &str, font_size: f64, max_width: f64) -> Vec
     }
 
     lines
+}
+
+/// Format an RGB triple as content-stream colour operands, clamping each
+/// channel into the [0.0, 1.0] range DeviceRGB operands require
+/// (ISO 32000 §8.6.4.2). Out-of-range channels are corrected silently,
+/// consistent with the crate's silent-correction convention (unknown fonts
+/// fall back to Helvetica, unknown origins fall through to defaults).
+/// Channels are always finite here: the config arrives as JSON, which cannot
+/// encode NaN/Infinity, and serde_json rejects non-finite numbers at parse.
+fn clamped_rgb(color: &[f64; 3]) -> String {
+    format!(
+        "{} {} {}",
+        color[0].clamp(0.0, 1.0),
+        color[1].clamp(0.0, 1.0),
+        color[2].clamp(0.0, 1.0)
+    )
 }
 
 /// Escape special characters for a PDF text string (parenthesised literal).
@@ -622,6 +638,13 @@ mod tests {
     }
 
     #[test]
+    fn clamped_rgb_clamps_out_of_range_channels() {
+        assert_eq!(clamped_rgb(&[1.5, -0.25, 0.5]), "1 0 0.5");
+        // In-range channels pass through unchanged
+        assert_eq!(clamped_rgb(&[0.0, 0.42, 1.0]), "0 0.42 1");
+    }
+
+    #[test]
     fn deserialize_line_defaults() {
         let json = r#"{"x1": 10, "y1": 20, "x2": 300, "y2": 400}"#;
         let line: LineItem = serde_json::from_str(json).unwrap();
@@ -860,6 +883,71 @@ mod tests {
         assert!(
             content.contains("50 686 Td (cccc) Tj"),
             "second wrapped line should sit one line_spacing below, got: {content}"
+        );
+    }
+
+    #[test]
+    fn test_apply_stamp_config_clamps_rgb_in_content_stream() {
+        // Out-of-range channels must be clamped into DeviceRGB's [0.0, 1.0]
+        // at the point of content-stream insertion, covering both a stroke
+        // (RG, line) and a fill (rg, stamp text) operator.
+        let mut doc = Document::new();
+        let pages_id = doc.new_object_id();
+
+        let content_id = doc.add_object(Stream::new(Dictionary::new(), Vec::new()));
+        let mut page_dict = Dictionary::new();
+        page_dict.set("Type", Object::Name(b"Page".to_vec()));
+        page_dict.set("Parent", Object::Reference(pages_id));
+        page_dict.set("MediaBox", Object::Array(vec![
+            Object::Integer(0), Object::Integer(0),
+            Object::Integer(612), Object::Integer(792),
+        ]));
+        page_dict.set("Contents", Object::Reference(content_id));
+        let page_id = doc.add_object(page_dict);
+
+        let mut pages_dict = Dictionary::new();
+        pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
+        pages_dict.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
+        pages_dict.set("Count", Object::Integer(1));
+        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
+
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+        catalog.set("Pages", Object::Reference(pages_id));
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let json = r#"{
+            "stamps": [{"text": "X", "x": 10, "y": 10, "origin_x": "left", "origin_y": "bottom", "size": 12, "color": [1.5, -0.25, 0.5]}],
+            "lines": [{"x1": 0, "y1": 0, "x2": 100, "y2": 0, "color": [1.5, -0.25, 0.5]}]
+        }"#;
+        let config: StampConfig = serde_json::from_str(json).unwrap();
+        apply_stamp_config(&mut doc, &config).expect("stamping should succeed");
+
+        let contents = match doc.get_object(page_id) {
+            Ok(Object::Dictionary(ref d)) => match d.get(b"Contents") {
+                Ok(Object::Array(ref a)) => a.clone(),
+                other => panic!("expected /Contents array after stamping, got {:?}", other),
+            },
+            other => panic!("expected page dictionary, got {:?}", other),
+        };
+        let stamp_ref = contents[1].as_reference().unwrap();
+        let content = match doc.get_object(stamp_ref) {
+            Ok(Object::Stream(ref s)) => String::from_utf8_lossy(&s.content).into_owned(),
+            other => panic!("expected stamp stream, got {:?}", other),
+        };
+
+        assert!(
+            content.contains("1 0 0.5 RG"),
+            "line stroke colour should be clamped, got: {content}"
+        );
+        assert!(
+            content.contains("1 0 0.5 rg"),
+            "stamp fill colour should be clamped, got: {content}"
+        );
+        assert!(
+            !content.contains("1.5") && !content.contains("-0.25"),
+            "unclamped channel values must never reach the output, got: {content}"
         );
     }
 
