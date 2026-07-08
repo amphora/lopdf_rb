@@ -125,6 +125,8 @@ doc.apply_visible_stamps({
 
 Raises `ArgumentError` if the config hash cannot be deserialized, and `RuntimeError` if a stamp cannot be applied (e.g. a font cannot be registered into a page's `/Resources`) — discard the document on error rather than saving it.
 
+`/Font` inside a page's `/Resources` is handled as either a direct dictionary or an indirect reference (both legal per ISO 32000 §7.8.3); a `/Font` reference that does not resolve to a dictionary raises rather than silently leaving the stamp text unrendered. Fonts registered on a page with inherited (parent-level) resources never mutate the shared parent dictionaries — the page gets its own resources copy.
+
 Colour channels outside 0.0–1.0 are clamped into range (DeviceRGB operands must be in [0.0, 1.0] per the PDF spec).
 
 ### `#save(path)` → `nil`
