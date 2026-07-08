@@ -601,6 +601,56 @@ fn add_font_to_resources(resources: &mut Dictionary, font_name: &str, font_id: O
 mod tests {
     use super::*;
 
+    fn us_letter_box() -> Vec<Object> {
+        vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(612),
+            Object::Integer(792),
+        ]
+    }
+
+    /// Build an `n`-page PDF for content-stream tests, mirroring the fixture
+    /// helpers in the sibling test modules (document.rs, annotation.rs,
+    /// manipulation.rs). `media_box: None` omits the MediaBox entirely so
+    /// the US Letter fallback path can be exercised. Returns the document
+    /// and the page ids in physical order.
+    fn build_test_pdf(page_count: usize, media_box: Option<Vec<Object>>) -> (Document, Vec<ObjectId>) {
+        let mut doc = Document::new();
+        let pages_id = doc.new_object_id();
+
+        let mut page_ids = Vec::new();
+        let mut kids = Vec::new();
+        for _ in 0..page_count {
+            let content_id = doc.add_object(Stream::new(Dictionary::new(), Vec::new()));
+
+            let mut page_dict = Dictionary::new();
+            page_dict.set("Type", Object::Name(b"Page".to_vec()));
+            page_dict.set("Parent", Object::Reference(pages_id));
+            if let Some(ref mb) = media_box {
+                page_dict.set("MediaBox", Object::Array(mb.clone()));
+            }
+            page_dict.set("Contents", Object::Reference(content_id));
+            let page_id = doc.add_object(page_dict);
+            page_ids.push(page_id);
+            kids.push(Object::Reference(page_id));
+        }
+
+        let mut pages_dict = Dictionary::new();
+        pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
+        pages_dict.set("Kids", Object::Array(kids));
+        pages_dict.set("Count", Object::Integer(page_count as i64));
+        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
+
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+        catalog.set("Pages", Object::Reference(pages_id));
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        (doc, page_ids)
+    }
+
     #[test]
     fn escape_pdf_text_special_chars() {
         assert_eq!(escape_pdf_text(r"a\b"), r"a\\b");
@@ -718,37 +768,7 @@ mod tests {
 
     #[test]
     fn test_apply_stamp_config_renders_on_all_pages() {
-        let mut doc = Document::new();
-        let pages_id = doc.new_object_id();
-
-        let mut kids = Vec::new();
-        for _ in 0..2 {
-            let content_stream = Stream::new(Dictionary::new(), Vec::new());
-            let content_id = doc.add_object(content_stream);
-
-            let mut page_dict = Dictionary::new();
-            page_dict.set("Type", Object::Name(b"Page".to_vec()));
-            page_dict.set("Parent", Object::Reference(pages_id));
-            page_dict.set("MediaBox", Object::Array(vec![
-                Object::Integer(0), Object::Integer(0),
-                Object::Integer(612), Object::Integer(792),
-            ]));
-            page_dict.set("Contents", Object::Reference(content_id));
-            let page_id = doc.add_object(page_dict);
-            kids.push(Object::Reference(page_id));
-        }
-
-        let mut pages_dict = Dictionary::new();
-        pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
-        pages_dict.set("Kids", Object::Array(kids.clone()));
-        pages_dict.set("Count", Object::Integer(2));
-        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
-
-        let mut catalog = Dictionary::new();
-        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
-        catalog.set("Pages", Object::Reference(pages_id));
-        let catalog_id = doc.add_object(catalog);
-        doc.trailer.set("Root", Object::Reference(catalog_id));
+        let (mut doc, _page_ids) = build_test_pdf(2, Some(us_letter_box()));
 
         let json = r#"{"stamps": [{"text": "VIEWED", "x": 10, "y": 10, "origin_x": "left", "origin_y": "bottom", "size": 12, "color": [0.5, 0.5, 0.5]}]}"#;
         let config: StampConfig = serde_json::from_str(json).unwrap();
@@ -773,27 +793,8 @@ mod tests {
         // against the US Letter fallback (612x792) rather than skipping the
         // page or using zero-collapsed dimensions. Pins the value of
         // geometry::US_LETTER_FALLBACK end-to-end through a real call site.
-        let mut doc = Document::new();
-        let pages_id = doc.new_object_id();
-
-        let content_id = doc.add_object(Stream::new(Dictionary::new(), Vec::new()));
-        let mut page_dict = Dictionary::new();
-        page_dict.set("Type", Object::Name(b"Page".to_vec()));
-        page_dict.set("Parent", Object::Reference(pages_id));
-        page_dict.set("Contents", Object::Reference(content_id));
-        let page_id = doc.add_object(page_dict);
-
-        let mut pages_dict = Dictionary::new();
-        pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
-        pages_dict.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
-        pages_dict.set("Count", Object::Integer(1));
-        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
-
-        let mut catalog = Dictionary::new();
-        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
-        catalog.set("Pages", Object::Reference(pages_id));
-        let catalog_id = doc.add_object(catalog);
-        doc.trailer.set("Root", Object::Reference(catalog_id));
+        let (mut doc, page_ids) = build_test_pdf(1, None);
+        let page_id = page_ids[0];
 
         // A line starting at (0 from right, 0 from top): with the fallback
         // dimensions the start point resolves to exactly (612, 792).
@@ -827,31 +828,8 @@ mod tests {
         // Courier is fixed-pitch: every glyph is 600 units = 6 pt/char at
         // size 10. "aaaa bbbb" = 24 + 6 + 24 = 54 pt <= 70; adding " cccc"
         // -> 84 pt > 70, so the block wraps to exactly two lines.
-        let mut doc = Document::new();
-        let pages_id = doc.new_object_id();
-
-        let content_id = doc.add_object(Stream::new(Dictionary::new(), Vec::new()));
-        let mut page_dict = Dictionary::new();
-        page_dict.set("Type", Object::Name(b"Page".to_vec()));
-        page_dict.set("Parent", Object::Reference(pages_id));
-        page_dict.set("MediaBox", Object::Array(vec![
-            Object::Integer(0), Object::Integer(0),
-            Object::Integer(612), Object::Integer(792),
-        ]));
-        page_dict.set("Contents", Object::Reference(content_id));
-        let page_id = doc.add_object(page_dict);
-
-        let mut pages_dict = Dictionary::new();
-        pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
-        pages_dict.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
-        pages_dict.set("Count", Object::Integer(1));
-        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
-
-        let mut catalog = Dictionary::new();
-        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
-        catalog.set("Pages", Object::Reference(pages_id));
-        let catalog_id = doc.add_object(catalog);
-        doc.trailer.set("Root", Object::Reference(catalog_id));
+        let (mut doc, page_ids) = build_test_pdf(1, Some(us_letter_box()));
+        let page_id = page_ids[0];
 
         let json = r#"{"text_blocks": [{"text": "aaaa bbbb cccc", "x": 50, "y": 700, "width": 70, "size": 10, "font": "Courier", "line_spacing": 14}]}"#;
         let config: StampConfig = serde_json::from_str(json).unwrap();
@@ -917,31 +895,8 @@ mod tests {
         // before reaching the content stream, covering both a stroke
         // (RG, line) and a fill (rg, stamp text) operator, plus negative
         // zero (in-range for clamp, but would emit "-0" unnormalized).
-        let mut doc = Document::new();
-        let pages_id = doc.new_object_id();
-
-        let content_id = doc.add_object(Stream::new(Dictionary::new(), Vec::new()));
-        let mut page_dict = Dictionary::new();
-        page_dict.set("Type", Object::Name(b"Page".to_vec()));
-        page_dict.set("Parent", Object::Reference(pages_id));
-        page_dict.set("MediaBox", Object::Array(vec![
-            Object::Integer(0), Object::Integer(0),
-            Object::Integer(612), Object::Integer(792),
-        ]));
-        page_dict.set("Contents", Object::Reference(content_id));
-        let page_id = doc.add_object(page_dict);
-
-        let mut pages_dict = Dictionary::new();
-        pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
-        pages_dict.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
-        pages_dict.set("Count", Object::Integer(1));
-        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
-
-        let mut catalog = Dictionary::new();
-        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
-        catalog.set("Pages", Object::Reference(pages_id));
-        let catalog_id = doc.add_object(catalog);
-        doc.trailer.set("Root", Object::Reference(catalog_id));
+        let (mut doc, page_ids) = build_test_pdf(1, Some(us_letter_box()));
+        let page_id = page_ids[0];
 
         let json = r#"{
             "stamps": [{"text": "X", "x": 10, "y": 10, "origin_x": "left", "origin_y": "bottom", "size": 12, "color": [1.5, -0.25, 0.5]}],
@@ -957,6 +912,8 @@ mod tests {
             },
             other => panic!("expected page dictionary, got {:?}", other),
         };
+        assert_eq!(contents.len(), 2, "Page should have original + stamp content streams");
+
         let stamp_ref = contents[1].as_reference().unwrap();
         let content = match doc.get_object(stamp_ref) {
             Ok(Object::Stream(ref s)) => String::from_utf8_lossy(&s.content).into_owned(),
@@ -979,33 +936,8 @@ mod tests {
 
     #[test]
     fn test_ensure_font_adds_to_resources() {
-        let mut doc = Document::new();
-        let pages_id = doc.new_object_id();
-
-        let content_stream = Stream::new(Dictionary::new(), Vec::new());
-        let content_id = doc.add_object(content_stream);
-
-        let mut page_dict = Dictionary::new();
-        page_dict.set("Type", Object::Name(b"Page".to_vec()));
-        page_dict.set("Parent", Object::Reference(pages_id));
-        page_dict.set("MediaBox", Object::Array(vec![
-            Object::Integer(0), Object::Integer(0),
-            Object::Integer(612), Object::Integer(792),
-        ]));
-        page_dict.set("Contents", Object::Reference(content_id));
-        let page_id = doc.add_object(page_dict);
-
-        let mut pages_dict = Dictionary::new();
-        pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
-        pages_dict.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
-        pages_dict.set("Count", Object::Integer(1));
-        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
-
-        let mut catalog = Dictionary::new();
-        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
-        catalog.set("Pages", Object::Reference(pages_id));
-        let catalog_id = doc.add_object(catalog);
-        doc.trailer.set("Root", Object::Reference(catalog_id));
+        let (mut doc, page_ids) = build_test_pdf(1, Some(us_letter_box()));
+        let page_id = page_ids[0];
 
         let font_name = ensure_font(&mut doc, page_id, "Helvetica")
             .expect("font registration should succeed");
@@ -1021,5 +953,41 @@ mod tests {
             }
         }
         panic!("Font not found in page resources");
+    }
+
+    #[test]
+    fn test_ensure_font_errors_when_page_unresolvable() {
+        // Unreachable through apply_stamp_config (get_pages only yields
+        // dictionary-resolvable ids) — called directly, as metadata.rs's
+        // error-path tests do. Pins the Err contract so a regression back
+        // to the old silent-skip guards cannot pass unnoticed.
+        let mut doc = Document::new();
+        let err = ensure_font(&mut doc, (9999, 0), "Helvetica")
+            .expect_err("a dangling page id must fail font registration");
+        assert!(
+            err.contains("cannot register font Helvetica"),
+            "unexpected error message: {err}"
+        );
+
+        // The ok-but-not-a-Dictionary shape (as_dict_mut failure).
+        let int_id = doc.add_object(Object::Integer(7));
+        let err = ensure_font(&mut doc, int_id, "Courier")
+            .expect_err("a non-dictionary page object must fail font registration");
+        assert!(
+            err.contains("cannot register font Courier"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_append_content_stream_errors_when_page_unresolvable() {
+        let mut doc = Document::new();
+        let stamp_id = doc.add_object(Stream::new(Dictionary::new(), Vec::new()));
+        let err = append_content_stream(&mut doc, (9999, 0), stamp_id)
+            .expect_err("a dangling page id must fail the content-stream append");
+        assert!(
+            err.contains("cannot append stamp content stream"),
+            "unexpected error message: {err}"
+        );
     }
 }
