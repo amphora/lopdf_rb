@@ -1,5 +1,5 @@
 use lopdf::{Document, Object, ObjectId, Dictionary};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Cursor;
 
 /// Rotate all pages in the document by the given angle (clockwise).
@@ -105,7 +105,7 @@ pub(crate) fn merge_documents(docs: &[&Document]) -> Result<Document, String> {
 
         // Separate pages from other objects
         let pages: BTreeMap<u32, ObjectId> = clone.get_pages();
-        let page_ids: Vec<ObjectId> = pages.values().copied().collect();
+        let page_ids: HashSet<ObjectId> = pages.values().copied().collect();
 
         for (id, object) in clone.objects {
             if page_ids.contains(&id) {
@@ -485,6 +485,34 @@ mod tests {
                 assert_eq!(mb[3], Object::Integer(400));
             } else {
                 panic!("Second page has no MediaBox");
+            }
+        }
+    }
+
+    #[test]
+    fn test_merge_many_pages() {
+        // Hot-path coverage for the page_ids membership check (AMPHTT-1161):
+        // three inputs with double-digit page counts run the renumber-then-
+        // classify cycle multiple times with different max_id offsets. A page
+        // the set misses never joins /Kids and drops the count; a non-page it
+        // wrongly claims leaves a /Kids entry without a real content stream.
+        let doc1 = create_test_pdf(12);
+        let doc2 = create_test_pdf(8);
+        let doc3 = create_test_pdf(5);
+        let merged = merge_documents(&[&doc1, &doc2, &doc3]).unwrap();
+        assert_eq!(merged.get_pages().len(), 25);
+
+        for (_page_num, page_id) in merged.get_pages() {
+            let stream_ids = merged.get_page_contents(page_id);
+            assert!(
+                !stream_ids.is_empty(),
+                "merged page {page_id:?} has no content stream — page/non-page misclassification"
+            );
+            for stream_id in stream_ids {
+                assert!(
+                    matches!(merged.get_object(stream_id), Ok(Object::Stream(_))),
+                    "merged page {page_id:?} /Contents -> {stream_id:?} is not a stream"
+                );
             }
         }
     }

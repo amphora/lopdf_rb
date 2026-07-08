@@ -148,6 +148,9 @@ cargo test               # run Rust unit tests
 cargo clippy             # lint
 ```
 
+CI (`.github/workflows/ci.yml`) runs `cargo test --workspace` on every
+pull request and push to `main`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
