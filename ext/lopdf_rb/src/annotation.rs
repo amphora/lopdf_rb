@@ -6,10 +6,10 @@ use lopdf::{Document, Object, ObjectId, Dictionary, StringFormat};
 /// The annotation is Hidden + NoView (F=34) so it never renders; `dlp_data`
 /// (typically a JSON blob with reader/document metadata) becomes its
 /// /Contents. Errors when the PDF has no pages, or when [`add_to_annots`]
-/// cannot wire the annotation into the page — in that case the
-/// already-inserted annotation object is left orphaned in `doc.objects`
-/// (harmless: the caller is expected to discard the document on error, as
-/// the Rails `PdfStamper` does).
+/// cannot wire the annotation into the page — in that case the pending
+/// annotation object is removed again, so the error leaves the document's
+/// object set as it was before the call (lopdf's `save` serializes every
+/// entry in `doc.objects`, reachable or not, so an orphan must not linger).
 pub(crate) fn add_invisible_annotation(doc: &mut Document, dlp_data: &str) -> Result<(), String> {
     let pages = doc.get_pages();
     let last_page_id = *pages.values().last()
@@ -32,7 +32,14 @@ pub(crate) fn add_invisible_annotation(doc: &mut Document, dlp_data: &str) -> Re
 
     // Add annotation reference to the page's /Annots array.
     // /Annots can be a direct Array or an indirect Reference to an Array.
-    add_to_annots(doc, last_page_id, annot_id)?;
+    if let Err(e) = add_to_annots(doc, last_page_id, annot_id) {
+        // The annotation was never wired into a page, so nothing references
+        // it — remove it from the object map directly. Leaving it orphaned
+        // would let a caller that saves despite the error embed the DLP
+        // payload as an unlinked but extractable object.
+        doc.objects.remove(&annot_id);
+        return Err(e);
+    }
 
     Ok(())
 }
@@ -44,7 +51,8 @@ pub(crate) fn add_invisible_annotation(doc: &mut Document, dlp_data: &str) -> Re
 /// and when an indirect /Annots reference does not resolve to an array —
 /// falling through to the direct path there would overwrite the reference
 /// with a fresh array and silently discard every pre-existing annotation.
-/// On `Err` the caller's already-inserted annotation object is left unwired.
+/// On `Err` nothing has been wired; the caller removes the pending
+/// annotation object.
 fn add_to_annots(doc: &mut Document, page_id: ObjectId, annot_id: ObjectId) -> Result<(), String> {
     // First, check if /Annots is an indirect reference and resolve it.
     // A page object that fails this read-only pass falls through to the
@@ -85,6 +93,12 @@ fn add_to_annots(doc: &mut Document, page_id: ObjectId, annot_id: ObjectId) -> R
                     annots.push(Object::Reference(annot_id));
                 }
                 _ => {
+                    // A Reference can never appear here — the snapshot above
+                    // diverted it to the indirect branch, which always
+                    // returns. Any other non-array value cannot hold
+                    // annotation references, so replacing it repairs the
+                    // malformed entry without discarding annotations (unlike
+                    // the indirect case, which errors).
                     page_dict.set("Annots", Object::Array(vec![Object::Reference(annot_id)]));
                 }
             }
@@ -248,10 +262,18 @@ mod tests {
         if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
             page_dict.set("Annots", Object::Reference(bogus_id));
         }
+        let object_count_before = doc.objects.len();
 
         let err = add_invisible_annotation(&mut doc, "dlp-data")
             .expect_err("should error when indirect /Annots is not an array");
         assert!(err.contains("/Annots"), "error should name /Annots: {}", err);
+
+        // The pending annotation object must be removed again on failure —
+        // an orphan would be serialized by save despite being unreachable.
+        assert_eq!(
+            doc.objects.len(), object_count_before,
+            "failed call should not leave an orphaned annotation object"
+        );
 
         // The malformed reference must be left untouched — not overwritten
         // with a fresh direct array, which in the general case would discard
