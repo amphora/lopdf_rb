@@ -290,6 +290,25 @@ mod tests {
     }
 
     #[test]
+    fn test_add_annotation_errors_when_indirect_annots_dangling() {
+        let mut doc = create_test_pdf(1);
+        let pages = doc.get_pages();
+        let page_id = *pages.values().next().unwrap();
+
+        // Malformed: /Annots references an object id that was never inserted
+        if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
+            page_dict.set("Annots", Object::Reference((9999, 0)));
+        }
+
+        let err = add_invisible_annotation(&mut doc, "dlp-data")
+            .expect_err("should error when the /Annots reference is dangling");
+        assert!(
+            err.contains("failed to resolve /Annots reference"),
+            "error should name the dangling reference: {}", err
+        );
+    }
+
+    #[test]
     fn test_add_to_annots_errors_on_dangling_page_object() {
         // Unreachable through add_invisible_annotation (get_pages only
         // yields resolvable dictionary ids) — call the helper directly to
@@ -301,7 +320,29 @@ mod tests {
 
         let err = add_to_annots(&mut doc, (9999, 0), annot_id)
             .expect_err("should error on a dangling page object");
-        assert!(err.contains("page object"), "error should name the page object: {}", err);
+        // Full phrase, not just "page object" — the sibling not-a-dictionary
+        // arm's message also contains that substring.
+        assert!(
+            err.contains("failed to resolve page object"),
+            "error should name the resolution failure: {}", err
+        );
+    }
+
+    #[test]
+    fn test_add_to_annots_errors_on_non_dictionary_page_object() {
+        // Also unreachable through the public path — direct call, as above.
+        let mut doc = create_test_pdf(1);
+        let not_a_page = doc.add_object(Object::Integer(7));
+        let mut annot = Dictionary::new();
+        annot.set("Type", Object::Name(b"Annot".to_vec()));
+        let annot_id = doc.add_object(annot);
+
+        let err = add_to_annots(&mut doc, not_a_page, annot_id)
+            .expect_err("should error on a non-dictionary page object");
+        assert!(
+            err.contains("is not a dictionary"),
+            "error should name the type mismatch: {}", err
+        );
     }
 
     #[test]
