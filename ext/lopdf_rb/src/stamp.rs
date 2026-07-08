@@ -361,6 +361,20 @@ fn require_dict_mut(
         .map_err(|e| format!("{}: {}", action(), e))
 }
 
+/// Immutable sibling of [`require_dict_mut`]: resolve an object id to its
+/// dictionary for a read the caller's contract requires to succeed,
+/// failing with `"<action>: <lopdf error>"`. The action closure is only
+/// evaluated on the error path.
+fn require_dict(
+    doc: &Document,
+    id: ObjectId,
+    action: impl FnOnce() -> String,
+) -> Result<&Dictionary, String> {
+    doc.get_object(id)
+        .and_then(Object::as_dict)
+        .map_err(|e| format!("{}: {}", action(), e))
+}
+
 /// Escape special characters for a PDF text string (parenthesised literal).
 fn escape_pdf_text(text: &str) -> String {
     text.replace('\\', "\\\\")
@@ -495,38 +509,34 @@ fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> Result
     let mut is_leaf = true;
     for _ in 0..32 {
         if let Ok(Object::Dictionary(ref dict)) = doc.get_object(current_id) {
-            match dict.get(b"Resources") {
+            // Resolve this node's /Resources to (dict, leaf location);
+            // `None` walks on to /Parent. Only the Reference arm is
+            // fallible: the nearest /Resources governs this page (ISO 32000
+            // §7.7.3.4) and becomes Phase 2's write target, so an
+            // unresolvable reference cannot be a lookup miss — walking on
+            // would substitute an ancestor no conforming reader consults,
+            // and falling to `Missing` would silently replace the corrupt
+            // entry with a fresh dict.
+            let found = match dict.get(b"Resources") {
                 Ok(Object::Reference(ref_id)) => {
-                    // The nearest /Resources governs this page (ISO 32000
-                    // §7.7.3.4) and becomes Phase 2's write target, so an
-                    // unresolvable reference cannot be a lookup miss: walking
-                    // on would substitute an ancestor no conforming reader
-                    // consults, and falling to `Missing` would silently
-                    // replace the corrupt entry with a fresh dict.
-                    let resources = doc
-                        .get_object(*ref_id)
-                        .and_then(Object::as_dict)
-                        .map_err(|e| {
-                            format!("cannot resolve /Resources reference {ref_id:?} for font {base_font}: {e}")
-                        })?;
-                    existing_name = find_font_in_resources(doc, resources, base_font);
-                    location = if is_leaf {
-                        ResourcesLocation::IndirectOnLeaf(*ref_id)
-                    } else {
-                        ResourcesLocation::Inherited(resources.clone())
-                    };
-                    break;
+                    let resources = require_dict(doc, *ref_id, || {
+                        format!("cannot resolve /Resources reference {ref_id:?} for font {base_font}")
+                    })?;
+                    Some((resources, ResourcesLocation::IndirectOnLeaf(*ref_id)))
                 }
                 Ok(Object::Dictionary(ref resources)) => {
-                    existing_name = find_font_in_resources(doc, resources, base_font);
-                    location = if is_leaf {
-                        ResourcesLocation::DirectOnLeaf
-                    } else {
-                        ResourcesLocation::Inherited(resources.clone())
-                    };
-                    break;
+                    Some((resources, ResourcesLocation::DirectOnLeaf))
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some((resources, leaf_location)) = found {
+                existing_name = find_font_in_resources(doc, resources, base_font);
+                location = if is_leaf {
+                    leaf_location
+                } else {
+                    ResourcesLocation::Inherited(resources.clone())
+                };
+                break;
             }
             if let Ok(Object::Reference(parent_id)) = dict.get(b"Parent") {
                 current_id = *parent_id;
@@ -592,12 +602,9 @@ fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> Result
                 // dict in the page-local resources clone (copy + add) rather
                 // than writing through the reference, so the shared font
                 // dictionary is never mutated.
-                let fonts = doc
-                    .get_object(fonts_id)
-                    .and_then(Object::as_dict)
-                    .map_err(|e| {
-                        format!("cannot register font {base_font} through the inherited /Font reference {fonts_id:?}: {e}")
-                    })?;
+                let fonts = require_dict(doc, fonts_id, || {
+                    format!("cannot register font {base_font} through the inherited /Font reference {fonts_id:?}")
+                })?;
                 let mut local_fonts = fonts.clone();
                 local_fonts.set(font_name.as_str(), Object::Reference(font_id));
                 inherited.set("Font", Object::Dictionary(local_fonts));
