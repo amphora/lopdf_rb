@@ -351,11 +351,11 @@ fn wrap_text(text: &str, base_font: &str, font_size: f64, max_width: f64) -> Vec
 /// shapes the old silent `if let Ok(Object::Dictionary(...))` guards
 /// swallowed: `get_object_mut` errors and ok-but-not-a-Dictionary objects.
 /// The action closure is only evaluated on the error path.
-fn require_dict_mut<'a>(
-    doc: &'a mut Document,
+fn require_dict_mut(
+    doc: &mut Document,
     id: ObjectId,
     action: impl FnOnce() -> String,
-) -> Result<&'a mut Dictionary, String> {
+) -> Result<&mut Dictionary, String> {
     doc.get_object_mut(id)
         .and_then(Object::as_dict_mut)
         .map_err(|e| format!("{}: {}", action(), e))
@@ -460,9 +460,18 @@ fn resolve_base_font(font: &Option<String>) -> &str {
 /// the /Parent chain for inherited Resources. Returns the font's resource name
 /// (e.g. "F_PS_Helvetica") for use in content stream Tf operators.
 ///
+/// /Font inside Resources may be a direct Dictionary or an indirect
+/// Reference (ISO 32000 §7.8.3) — lookups dereference it, and registration
+/// writes through the reference on leaf pages. When registration is needed
+/// against inherited resources, they are cloned onto the leaf page with any
+/// indirect /Font promoted to a direct dict, so a parent font dictionary
+/// shared with sibling pages is never mutated. A lookup hit returns early
+/// and leaves the page untouched — no clone, no page-local /Resources.
+///
 /// Returns `Err` when the page or its /Resources cannot be accessed for
-/// mutation — a swallowed failure here would leave content streams
-/// referencing a font that was never registered, which renders blank.
+/// mutation, or when a /Font reference does not resolve to a dictionary —
+/// a swallowed failure here would leave content streams referencing a font
+/// that was never registered, which renders blank.
 /// On `Err` the freshly created font object has already been added to the
 /// document but is wired into no /Resources — an orphan, harmless because
 /// callers discard the document on error (see `apply_stamp_config`).
@@ -535,12 +544,21 @@ fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> Result
     // so a composed error carries a single page reference.
     let page_ctx = || format!("cannot register font {base_font} on the page");
 
+    // In every branch, `add_font_to_resources` returning `Some(id)` means
+    // /Font is an indirect Reference the insert could not go through — the
+    // write completes via the referenced dict (leaf branches) or a page-local
+    // promotion (Inherited), and an unresolvable reference is an `Err`, never
+    // a silent direct-/Font overwrite. The error path is reachable only from
+    // the `Some` arm: a successful direct insert never touches /Font again,
+    // so pre-existing direct entries cannot be clobbered.
     match location {
         ResourcesLocation::IndirectOnLeaf(res_id) => {
             let resources = require_dict_mut(doc, res_id, || {
                 format!("cannot register font {base_font} in /Resources {res_id:?}")
             })?;
-            add_font_to_resources(resources, &font_name, font_id);
+            if let Some(fonts_id) = add_font_to_resources(resources, &font_name, font_id) {
+                write_font_through_ref(doc, fonts_id, &font_name, font_id, base_font)?;
+            }
         }
         ResourcesLocation::DirectOnLeaf => {
             let page_dict = require_dict_mut(doc, page_id, page_ctx)?;
@@ -550,17 +568,35 @@ fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> Result
                 .map_err(|e| {
                     format!("cannot register font {base_font} in the page's direct /Resources: {e}")
                 })?;
-            add_font_to_resources(resources, &font_name, font_id);
+            if let Some(fonts_id) = add_font_to_resources(resources, &font_name, font_id) {
+                write_font_through_ref(doc, fonts_id, &font_name, font_id, base_font)?;
+            }
         }
         ResourcesLocation::Inherited(mut inherited) => {
-            add_font_to_resources(&mut inherited, &font_name, font_id);
+            if let Some(fonts_id) = add_font_to_resources(&mut inherited, &font_name, font_id) {
+                // The inherited /Font is an indirect reference to a dict the
+                // parent shares with sibling pages — promote it to a direct
+                // dict in the page-local resources clone (copy + add) rather
+                // than writing through the reference, so the shared font
+                // dictionary is never mutated.
+                let fonts = doc
+                    .get_object(fonts_id)
+                    .and_then(Object::as_dict)
+                    .map_err(|e| {
+                        format!("cannot register font {base_font} through the inherited /Font reference {fonts_id:?}: {e}")
+                    })?;
+                let mut local_fonts = fonts.clone();
+                local_fonts.set(font_name.as_str(), Object::Reference(font_id));
+                inherited.set("Font", Object::Dictionary(local_fonts));
+            }
             let page_dict = require_dict_mut(doc, page_id, page_ctx)?;
             page_dict.set("Resources", Object::Dictionary(inherited));
         }
         ResourcesLocation::Missing => {
             let page_dict = require_dict_mut(doc, page_id, page_ctx)?;
             let mut resources = Dictionary::new();
-            add_font_to_resources(&mut resources, &font_name, font_id);
+            let created = add_font_to_resources(&mut resources, &font_name, font_id);
+            debug_assert!(created.is_none(), "a fresh dict cannot hold an indirect /Font");
             page_dict.set("Resources", Object::Dictionary(resources));
         }
     }
@@ -568,17 +604,53 @@ fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> Result
     Ok(font_name)
 }
 
+/// Complete a font registration whose /Font entry is an indirect reference:
+/// write the entry into the referenced dictionary. Errs when the reference
+/// does not resolve to a dictionary — falling back to a direct /Font write
+/// there would mask document corruption (the d36e4b0f lesson, adapted to
+/// the post-AMPHTT-1159 error contract).
+fn write_font_through_ref(
+    doc: &mut Document,
+    fonts_id: ObjectId,
+    font_name: &str,
+    font_id: ObjectId,
+    base_font: &str,
+) -> Result<(), String> {
+    let fonts = require_dict_mut(doc, fonts_id, || {
+        format!("cannot register font {base_font} through the indirect /Font reference {fonts_id:?}")
+    })?;
+    fonts.set(font_name, Object::Reference(font_id));
+    Ok(())
+}
+
 /// Search for an existing font with the given BaseFont name in a Resources dictionary.
-/// Returns the font's resource key name if found.
+/// Returns the font's resource key name if found. Handles /Font as either a
+/// direct Dictionary or an indirect Reference (ISO 32000 §7.8.3 permits both).
+/// An unresolvable Reference yields None — "not found" is the right answer
+/// for a lookup; the registration path reports the broken reference as `Err`.
 fn find_font_in_resources(doc: &Document, resources: &Dictionary, base_font: &str) -> Option<String> {
-    if let Ok(Object::Dictionary(ref fonts)) = resources.get(b"Font") {
-        for (name, font_ref) in fonts.iter() {
-            if let Object::Reference(fref) = font_ref {
-                if let Ok(Object::Dictionary(ref font_dict)) = doc.get_object(*fref) {
-                    if let Ok(Object::Name(ref bf)) = font_dict.get(b"BaseFont") {
-                        if bf == base_font.as_bytes() {
-                            return Some(String::from_utf8_lossy(name).to_string());
-                        }
+    match resources.get(b"Font") {
+        Ok(Object::Dictionary(ref fonts)) => find_base_font_in(doc, fonts, base_font),
+        Ok(Object::Reference(ref_id)) => {
+            if let Ok(Object::Dictionary(ref fonts)) = doc.get_object(*ref_id) {
+                find_base_font_in(doc, fonts, base_font)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Search a /Font dictionary for an entry with the given BaseFont name.
+fn find_base_font_in(doc: &Document, fonts: &Dictionary, base_font: &str) -> Option<String> {
+    let target = base_font.as_bytes();
+    for (name, font_ref) in fonts.iter() {
+        if let Object::Reference(fref) = font_ref {
+            if let Ok(Object::Dictionary(ref font_dict)) = doc.get_object(*fref) {
+                if let Ok(Object::Name(ref bf)) = font_dict.get(b"BaseFont") {
+                    if bf == target {
+                        return Some(String::from_utf8_lossy(name).to_string());
                     }
                 }
             }
@@ -587,14 +659,22 @@ fn find_font_in_resources(doc: &Document, resources: &Dictionary, base_font: &st
     None
 }
 
-fn add_font_to_resources(resources: &mut Dictionary, font_name: &str, font_id: ObjectId) {
-    let has_font = resources.get(b"Font").is_ok();
-    if !has_font {
-        resources.set("Font", Object::Dictionary(Dictionary::new()));
+/// Add a font to a Resources /Font dictionary.
+/// Returns `Some(object_id)` when /Font is an indirect Reference the caller
+/// must write through instead (this function holds only the resources dict,
+/// not the document, so it cannot dereference). Discarding the `Some` silently
+/// drops the registration — the caller must complete or fail the write.
+#[must_use]
+fn add_font_to_resources(resources: &mut Dictionary, font_name: &str, font_id: ObjectId) -> Option<ObjectId> {
+    match resources.get(b"Font") {
+        Ok(Object::Reference(ref_id)) => return Some(*ref_id),
+        Ok(Object::Dictionary(_)) => {}
+        _ => resources.set("Font", Object::Dictionary(Dictionary::new())),
     }
     if let Ok(Object::Dictionary(ref mut fonts)) = resources.get_mut(b"Font") {
         fonts.set(font_name, Object::Reference(font_id));
     }
+    None
 }
 
 #[cfg(test)]
