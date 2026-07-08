@@ -729,6 +729,95 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_stamp_config_renders_text_block_with_line_spacing() {
+        // Courier is fixed-pitch: every glyph is 600 units = 6 pt/char at
+        // size 10. "aaaa bbbb" = 24 + 6 + 24 = 54 pt <= 70; adding " cccc"
+        // -> 84 pt > 70, so the block wraps to exactly two lines.
+        let mut doc = Document::new();
+        let pages_id = doc.new_object_id();
+
+        let content_id = doc.add_object(Stream::new(Dictionary::new(), Vec::new()));
+        let mut page_dict = Dictionary::new();
+        page_dict.set("Type", Object::Name(b"Page".to_vec()));
+        page_dict.set("Parent", Object::Reference(pages_id));
+        page_dict.set("MediaBox", Object::Array(vec![
+            Object::Integer(0), Object::Integer(0),
+            Object::Integer(612), Object::Integer(792),
+        ]));
+        page_dict.set("Contents", Object::Reference(content_id));
+        let page_id = doc.add_object(page_dict);
+
+        let mut pages_dict = Dictionary::new();
+        pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
+        pages_dict.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
+        pages_dict.set("Count", Object::Integer(1));
+        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
+
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+        catalog.set("Pages", Object::Reference(pages_id));
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let json = r#"{"text_blocks": [{"text": "aaaa bbbb cccc", "x": 50, "y": 700, "width": 70, "size": 10, "font": "Courier", "line_spacing": 14}]}"#;
+        let config: StampConfig = serde_json::from_str(json).unwrap();
+        apply_stamp_config(&mut doc, &config);
+
+        let contents = match doc.get_object(page_id) {
+            Ok(Object::Dictionary(ref d)) => match d.get(b"Contents") {
+                Ok(Object::Array(ref a)) => a.clone(),
+                other => panic!("expected /Contents array after stamping, got {:?}", other),
+            },
+            other => panic!("expected page dictionary, got {:?}", other),
+        };
+        assert_eq!(contents.len(), 2, "Page should have original + stamp content streams");
+
+        let stamp_ref = contents[1].as_reference().unwrap();
+        let content = match doc.get_object(stamp_ref) {
+            Ok(Object::Stream(ref s)) => String::from_utf8_lossy(&s.content).into_owned(),
+            other => panic!("expected stamp stream, got {:?}", other),
+        };
+
+        // Text-showing structure and font selection
+        assert!(content.contains("BT"), "should open a text object, got: {content}");
+        assert!(content.contains("ET"), "should close the text object, got: {content}");
+        assert!(
+            content.contains("/F_PS_Courier 10 Tf"),
+            "should select the registered font, got: {content}"
+        );
+
+        // The /Tf reference is registered, not dangling:
+        // /Resources -> /Font -> F_PS_Courier on the page
+        let resources = match doc.get_object(page_id) {
+            Ok(Object::Dictionary(ref d)) => match d.get(b"Resources") {
+                Ok(Object::Dictionary(ref r)) => r.clone(),
+                other => panic!("expected direct /Resources dictionary, got {:?}", other),
+            },
+            other => panic!("expected page dictionary, got {:?}", other),
+        };
+        match resources.get(b"Font") {
+            Ok(Object::Dictionary(ref fonts)) => assert!(
+                fonts.get(b"F_PS_Courier").is_ok(),
+                "F_PS_Courier should be registered in /Resources"
+            ),
+            other => panic!("expected /Font dictionary in /Resources, got {:?}", other),
+        }
+
+        // Wrapped lines step down by exactly line_spacing: 700, then
+        // 700 - 14 = 686. If line_spacing were ignored (the 0-spacing
+        // overlap failure) both lines would land at y=700 and the second
+        // assertion would fail — the test cannot pass vacuously.
+        assert!(
+            content.contains("50 700 Td (aaaa bbbb) Tj"),
+            "first wrapped line should sit at the block origin, got: {content}"
+        );
+        assert!(
+            content.contains("50 686 Td (cccc) Tj"),
+            "second wrapped line should sit one line_spacing below, got: {content}"
+        );
+    }
+
+    #[test]
     fn test_ensure_font_adds_to_resources() {
         let mut doc = Document::new();
         let pages_id = doc.new_object_id();
