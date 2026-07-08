@@ -805,6 +805,24 @@ mod tests {
         }
     }
 
+    /// Navigate page → direct /Resources → direct /Font, panicking with a
+    /// which-level message on any mismatch; callers assert on the returned
+    /// dictionary's contents. #[track_caller] keeps panic locations at the
+    /// calling test rather than in here.
+    #[track_caller]
+    fn page_font_dict(doc: &Document, page_id: ObjectId) -> &Dictionary {
+        match doc.get_object(page_id) {
+            Ok(Object::Dictionary(ref page_dict)) => match page_dict.get(b"Resources") {
+                Ok(Object::Dictionary(ref resources)) => match resources.get(b"Font") {
+                    Ok(Object::Dictionary(ref fonts)) => fonts,
+                    other => panic!("expected direct /Font dict, got {other:?}"),
+                },
+                other => panic!("expected direct /Resources dict, got {other:?}"),
+            },
+            other => panic!("expected page dictionary, got {other:?}"),
+        }
+    }
+
     #[test]
     fn escape_pdf_text_special_chars() {
         assert_eq!(escape_pdf_text(r"a\b"), r"a\\b");
@@ -1014,20 +1032,11 @@ mod tests {
 
         // The /Tf reference is registered, not dangling:
         // /Resources -> /Font -> F_PS_Courier on the page
-        let resources = match doc.get_object(page_id) {
-            Ok(Object::Dictionary(ref d)) => match d.get(b"Resources") {
-                Ok(Object::Dictionary(ref r)) => r.clone(),
-                other => panic!("expected direct /Resources dictionary, got {:?}", other),
-            },
-            other => panic!("expected page dictionary, got {:?}", other),
-        };
-        match resources.get(b"Font") {
-            Ok(Object::Dictionary(ref fonts)) => assert!(
-                fonts.get(b"F_PS_Courier").is_ok(),
-                "F_PS_Courier should be registered in /Resources"
-            ),
-            other => panic!("expected /Font dictionary in /Resources, got {:?}", other),
-        }
+        let fonts = page_font_dict(&doc, page_id);
+        assert!(
+            fonts.get(b"F_PS_Courier").is_ok(),
+            "F_PS_Courier should be registered in /Resources"
+        );
 
         // Wrapped lines step down by exactly line_spacing: 700, then
         // 700 - 14 = 686. If line_spacing were ignored (the 0-spacing
@@ -1190,20 +1199,12 @@ mod tests {
             object_count,
             "a lookup hit should not add objects or re-register the font"
         );
-        match doc.get_object(page_id) {
-            Ok(Object::Dictionary(ref page_dict)) => match page_dict.get(b"Resources") {
-                Ok(Object::Dictionary(ref resources)) => match resources.get(b"Font") {
-                    Ok(Object::Dictionary(ref fonts)) => assert_eq!(
-                        fonts.len(),
-                        1,
-                        "no duplicate entry should be registered alongside TR7"
-                    ),
-                    other => panic!("expected direct /Font dict, got {other:?}"),
-                },
-                other => panic!("expected direct /Resources, got {other:?}"),
-            },
-            other => panic!("expected page dictionary, got {other:?}"),
-        }
+        let fonts = page_font_dict(&doc, page_id);
+        assert_eq!(
+            fonts.len(),
+            1,
+            "no duplicate entry should be registered alongside TR7"
+        );
     }
 
     #[test]
@@ -1310,25 +1311,15 @@ mod tests {
 
         // The page gained its own /Resources whose /Font was promoted to a
         // direct dict holding the inherited font plus the new one.
-        match doc.get_object(page_id) {
-            Ok(Object::Dictionary(ref page_dict)) => match page_dict.get(b"Resources") {
-                Ok(Object::Dictionary(ref resources)) => match resources.get(b"Font") {
-                    Ok(Object::Dictionary(ref fonts)) => {
-                        assert!(
-                            find_base_font_in(&doc, fonts, "Times-Roman").is_some(),
-                            "inherited font should be carried into the promoted dict"
-                        );
-                        assert!(
-                            find_base_font_in(&doc, fonts, "Courier").is_some(),
-                            "new font should be in the promoted dict"
-                        );
-                    }
-                    other => panic!("promotion should leave a direct /Font dict, got {other:?}"),
-                },
-                other => panic!("page should gain its own direct /Resources, got {other:?}"),
-            },
-            other => panic!("expected page dictionary, got {other:?}"),
-        }
+        let fonts = page_font_dict(&doc, page_id);
+        assert!(
+            find_base_font_in(&doc, fonts, "Times-Roman").is_some(),
+            "inherited font should be carried into the promoted dict"
+        );
+        assert!(
+            find_base_font_in(&doc, fonts, "Courier").is_some(),
+            "new font should be in the promoted dict"
+        );
 
         // The shared referenced font dict is unmutated — still exactly its
         // original single entry — and the sibling page still inherits it.
@@ -1426,6 +1417,7 @@ mod tests {
         if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
             page_dict.set("Resources", Object::Reference((9999, 0)));
         }
+        let object_count = doc.objects.len();
 
         let err = ensure_font(&mut doc, page_id, "Helvetica")
             .expect_err("a dangling leaf /Resources reference must fail font registration");
@@ -1434,8 +1426,14 @@ mod tests {
             "unexpected error message: {err}"
         );
 
-        // The page must be untouched — the Err fires in the /Parent walk,
-        // before any Phase 2 write could replace the reference.
+        // The document must be untouched — the Err fires in the /Parent
+        // walk, before Phase 2 could replace the reference or create the
+        // (orphan) font object it would add on later error paths.
+        assert_eq!(
+            doc.objects.len(),
+            object_count,
+            "a /Parent-walk Err must not add objects"
+        );
         match doc.get_object(page_id) {
             Ok(Object::Dictionary(ref page_dict)) => match page_dict.get(b"Resources") {
                 Ok(Object::Reference(r)) => assert_eq!(*r, (9999, 0)),
@@ -1449,12 +1447,25 @@ mod tests {
         if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
             page_dict.set("Resources", Object::Reference(int_id));
         }
+        let object_count = doc.objects.len();
         let err = ensure_font(&mut doc, page_id, "Courier")
             .expect_err("a /Resources reference to a non-dictionary must fail font registration");
         assert!(
             err.contains("cannot resolve /Resources reference"),
             "unexpected error message: {err}"
         );
+        assert_eq!(
+            doc.objects.len(),
+            object_count,
+            "a /Parent-walk Err must not add objects"
+        );
+        match doc.get_object(page_id) {
+            Ok(Object::Dictionary(ref page_dict)) => match page_dict.get(b"Resources") {
+                Ok(Object::Reference(r)) => assert_eq!(*r, int_id),
+                other => panic!("non-dict /Resources reference was replaced with {other:?}"),
+            },
+            other => panic!("expected page dictionary, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1483,12 +1494,18 @@ mod tests {
             pages_dict.set("Parent", Object::Reference(grandparent_id));
             pages_dict.set("Resources", Object::Reference((9999, 0)));
         }
+        let object_count = doc.objects.len();
 
         let err = ensure_font(&mut doc, page_id, "Courier")
             .expect_err("a dangling intermediate /Resources reference must fail");
         assert!(
             err.contains("cannot resolve /Resources reference"),
             "unexpected error message: {err}"
+        );
+        assert_eq!(
+            doc.objects.len(),
+            object_count,
+            "a /Parent-walk Err must not add objects"
         );
     }
 
@@ -1506,19 +1523,11 @@ mod tests {
             .expect("a malformed direct /Font value should be repaired");
         assert_eq!(font_name, "F_PS_Courier");
 
-        match doc.get_object(page_id) {
-            Ok(Object::Dictionary(ref page_dict)) => match page_dict.get(b"Resources") {
-                Ok(Object::Dictionary(ref resources)) => match resources.get(b"Font") {
-                    Ok(Object::Dictionary(ref fonts)) => assert!(
-                        matches!(fonts.get(b"F_PS_Courier"), Ok(Object::Reference(_))),
-                        "repaired /Font dict should hold the new font reference"
-                    ),
-                    other => panic!("expected repaired direct /Font dict, got {other:?}"),
-                },
-                other => panic!("expected direct /Resources, got {other:?}"),
-            },
-            other => panic!("expected page dictionary, got {other:?}"),
-        }
+        let fonts = page_font_dict(&doc, page_id);
+        assert!(
+            matches!(fonts.get(b"F_PS_Courier"), Ok(Object::Reference(_))),
+            "repaired /Font dict should hold the new font reference"
+        );
     }
 
     #[test]
@@ -1537,25 +1546,15 @@ mod tests {
             .expect("registration into a direct /Font dict should succeed");
         assert_eq!(font_name, "F_PS_Courier");
 
-        match doc.get_object(page_id) {
-            Ok(Object::Dictionary(ref page_dict)) => match page_dict.get(b"Resources") {
-                Ok(Object::Dictionary(ref resources)) => match resources.get(b"Font") {
-                    Ok(Object::Dictionary(ref fonts)) => {
-                        assert!(
-                            fonts.get(b"F1").is_ok(),
-                            "pre-existing direct entry must survive registration"
-                        );
-                        assert!(
-                            fonts.get(b"F_PS_Courier").is_ok(),
-                            "new font should be added alongside"
-                        );
-                    }
-                    other => panic!("expected direct /Font dict, got {other:?}"),
-                },
-                other => panic!("expected direct /Resources, got {other:?}"),
-            },
-            other => panic!("expected page dictionary, got {other:?}"),
-        }
+        let fonts = page_font_dict(&doc, page_id);
+        assert!(
+            fonts.get(b"F1").is_ok(),
+            "pre-existing direct entry must survive registration"
+        );
+        assert!(
+            fonts.get(b"F_PS_Courier").is_ok(),
+            "new font should be added alongside"
+        );
     }
 
     #[test]
