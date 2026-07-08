@@ -119,7 +119,12 @@ fn default_thickness() -> f64 { 0.5 }
 /// Iterates all pages, reads each page's dimensions from MediaBox,
 /// resolves origin-relative coordinates, and appends a content stream
 /// with the stamp text.
-pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) {
+///
+/// Returns `Err` when a page's font registration or content-stream append
+/// fails. The first failure aborts the loop, so earlier pages remain stamped
+/// in the in-memory document — callers must discard the document on error
+/// rather than save it.
+pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) -> Result<(), String> {
     // Collect (page number, page ID) pairs so we can mutate doc afterwards —
     // get_pages() returns a BTreeMap, so iteration is already sorted by the
     // 1-based physical page number.
@@ -130,7 +135,7 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) {
 
     // If no pages, nothing to do
     if page_ids.is_empty() {
-        return;
+        return Ok(());
     }
 
     // Read dimensions for each page before mutating
@@ -138,7 +143,7 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) {
         .map(|&(page_number, pid)| get_page_dimensions_or_fallback(doc, pid, page_number))
         .collect();
 
-    for (i, &(_, page_id)) in page_ids.iter().enumerate() {
+    for (i, &(page_number, page_id)) in page_ids.iter().enumerate() {
         let (page_width, page_height) = dimensions[i];
 
         // Build content stream for all stamp items on this page.
@@ -181,7 +186,8 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) {
 
         for item in &config.stamps {
             let base_font = resolve_base_font(&item.font);
-            let font_name = ensure_font(doc, page_id, base_font);
+            let font_name = ensure_font(doc, page_id, base_font)
+                .map_err(|e| format!("page {page_number}: {e}"))?;
 
             let mut abs_x = resolve_x(item.x, &item.origin_x, page_width);
             let mut abs_y = resolve_y(item.y, &item.origin_y, page_height);
@@ -227,7 +233,8 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) {
         // Render text blocks (word-wrapped)
         for block in &config.text_blocks {
             let base_font = resolve_base_font(&block.font);
-            let font_name = ensure_font(doc, page_id, base_font);
+            let font_name = ensure_font(doc, page_id, base_font)
+                .map_err(|e| format!("page {page_number}: {e}"))?;
 
             let abs_x = resolve_x(block.x, &block.origin_x, page_width);
             let abs_y = resolve_y(block.y, &block.origin_y, page_height);
@@ -261,8 +268,11 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) {
         // Snapshot existing Contents (immutable borrow) before mutating,
         // because direct Stream objects need to be cloned and added as
         // indirect objects to avoid borrow conflicts.
-        append_content_stream(doc, page_id, stamp_id);
+        append_content_stream(doc, page_id, stamp_id)
+            .map_err(|e| format!("page {page_number}: {e}"))?;
     }
+
+    Ok(())
 }
 
 /// Word-wrap text to fit within `max_width` points.
@@ -321,7 +331,12 @@ fn escape_pdf_text(text: &str) -> String {
 /// /Contents can be a Reference (to a Stream or Array), a direct Array,
 /// a direct Stream, or absent. References are dereferenced to determine
 /// the target type (ISO 32000 §7.7.3.3).
-fn append_content_stream(doc: &mut Document, page_id: ObjectId, stamp_id: ObjectId) {
+///
+/// Returns `Err` when the page dictionary cannot be accessed for mutation —
+/// the stamp stream has already been added as an object at that point, but
+/// is not wired into any /Contents, so the caller must treat the document
+/// as broken rather than saved-with-a-missing-stamp.
+fn append_content_stream(doc: &mut Document, page_id: ObjectId, stamp_id: ObjectId) -> Result<(), String> {
     // Snapshot the existing Contents with an immutable borrow.
     // References are dereferenced to distinguish stream vs array targets.
     enum ContentsKind {
@@ -356,31 +371,35 @@ fn append_content_stream(doc: &mut Document, page_id: ObjectId, stamp_id: Object
     };
 
     // Now mutate the page dict
-    if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
-        match kind {
-            ContentsKind::RefStream(existing_ref) => {
+    let page_dict = doc
+        .get_object_mut(page_id)
+        .and_then(Object::as_dict_mut)
+        .map_err(|e| format!("cannot append stamp content stream to page {:?}: {}", page_id, e))?;
+    match kind {
+        ContentsKind::RefStream(existing_ref) => {
+            page_dict.set("Contents", Object::Array(vec![
+                Object::Reference(existing_ref),
+                Object::Reference(stamp_id),
+            ]));
+        }
+        ContentsKind::RefArray(mut existing_arr) | ContentsKind::Array(mut existing_arr) => {
+            existing_arr.push(Object::Reference(stamp_id));
+            page_dict.set("Contents", Object::Array(existing_arr));
+        }
+        ContentsKind::Stream(_) => {
+            if let Some(existing_id) = promoted_id {
                 page_dict.set("Contents", Object::Array(vec![
-                    Object::Reference(existing_ref),
+                    Object::Reference(existing_id),
                     Object::Reference(stamp_id),
                 ]));
             }
-            ContentsKind::RefArray(mut existing_arr) | ContentsKind::Array(mut existing_arr) => {
-                existing_arr.push(Object::Reference(stamp_id));
-                page_dict.set("Contents", Object::Array(existing_arr));
-            }
-            ContentsKind::Stream(_) => {
-                if let Some(existing_id) = promoted_id {
-                    page_dict.set("Contents", Object::Array(vec![
-                        Object::Reference(existing_id),
-                        Object::Reference(stamp_id),
-                    ]));
-                }
-            }
-            ContentsKind::Empty => {
-                page_dict.set("Contents", Object::Array(vec![Object::Reference(stamp_id)]));
-            }
+        }
+        ContentsKind::Empty => {
+            page_dict.set("Contents", Object::Array(vec![Object::Reference(stamp_id)]));
         }
     }
+
+    Ok(())
 }
 
 /// Validate and resolve the font name. Returns a standard PDF base font name,
@@ -396,7 +415,11 @@ fn resolve_base_font(font: &Option<String>) -> &str {
 /// Ensure the requested base font exists in the page's /Resources, walking
 /// the /Parent chain for inherited Resources. Returns the font's resource name
 /// (e.g. "F_PS_Helvetica") for use in content stream Tf operators.
-fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> String {
+///
+/// Returns `Err` when the page or its /Resources cannot be accessed for
+/// mutation — a swallowed failure here would leave content streams
+/// referencing a font that was never registered, which renders blank.
+fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> Result<String, String> {
     // Phase 1: Walk /Parent chain to find /Resources (inheritable per ISO 32000).
     // Snapshot the location so we can mutate afterwards without borrow conflicts.
     enum ResourcesLocation {
@@ -448,7 +471,7 @@ fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> String
     }
 
     if let Some(name) = existing_name {
-        return name;
+        return Ok(name);
     }
 
     // Phase 2: Font not found — add it
@@ -462,33 +485,56 @@ fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> String
 
     match location {
         ResourcesLocation::IndirectOnLeaf(res_id) => {
-            if let Ok(Object::Dictionary(ref mut resources)) = doc.get_object_mut(res_id) {
-                add_font_to_resources(resources, &font_name, font_id);
-            }
+            let resources = doc
+                .get_object_mut(res_id)
+                .and_then(Object::as_dict_mut)
+                .map_err(|e| {
+                    format!("cannot register font {} in /Resources {:?}: {}", base_font, res_id, e)
+                })?;
+            add_font_to_resources(resources, &font_name, font_id);
         }
         ResourcesLocation::DirectOnLeaf => {
-            if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
-                if let Ok(Object::Dictionary(ref mut resources)) = page_dict.get_mut(b"Resources") {
-                    add_font_to_resources(resources, &font_name, font_id);
-                }
-            }
+            let page_dict = doc
+                .get_object_mut(page_id)
+                .and_then(Object::as_dict_mut)
+                .map_err(|e| {
+                    format!("cannot register font {} on page {:?}: {}", base_font, page_id, e)
+                })?;
+            let resources = page_dict
+                .get_mut(b"Resources")
+                .and_then(Object::as_dict_mut)
+                .map_err(|e| {
+                    format!(
+                        "cannot register font {} in page {:?}'s direct /Resources: {}",
+                        base_font, page_id, e
+                    )
+                })?;
+            add_font_to_resources(resources, &font_name, font_id);
         }
         ResourcesLocation::Inherited(mut inherited) => {
             add_font_to_resources(&mut inherited, &font_name, font_id);
-            if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
-                page_dict.set("Resources", Object::Dictionary(inherited));
-            }
+            let page_dict = doc
+                .get_object_mut(page_id)
+                .and_then(Object::as_dict_mut)
+                .map_err(|e| {
+                    format!("cannot register font {} on page {:?}: {}", base_font, page_id, e)
+                })?;
+            page_dict.set("Resources", Object::Dictionary(inherited));
         }
         ResourcesLocation::Missing => {
-            if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
-                let mut resources = Dictionary::new();
-                add_font_to_resources(&mut resources, &font_name, font_id);
-                page_dict.set("Resources", Object::Dictionary(resources));
-            }
+            let page_dict = doc
+                .get_object_mut(page_id)
+                .and_then(Object::as_dict_mut)
+                .map_err(|e| {
+                    format!("cannot register font {} on page {:?}: {}", base_font, page_id, e)
+                })?;
+            let mut resources = Dictionary::new();
+            add_font_to_resources(&mut resources, &font_name, font_id);
+            page_dict.set("Resources", Object::Dictionary(resources));
         }
     }
 
-    font_name
+    Ok(font_name)
 }
 
 /// Search for an existing font with the given BaseFont name in a Resources dictionary.
@@ -658,7 +704,7 @@ mod tests {
 
         let json = r#"{"stamps": [{"text": "VIEWED", "x": 10, "y": 10, "origin_x": "left", "origin_y": "bottom", "size": 12, "color": [0.5, 0.5, 0.5]}]}"#;
         let config: StampConfig = serde_json::from_str(json).unwrap();
-        apply_stamp_config(&mut doc, &config);
+        apply_stamp_config(&mut doc, &config).expect("stamping should succeed");
 
         // Each page should now have a /Contents array with 2 elements (original + stamp)
         let pages = doc.get_pages();
@@ -705,7 +751,7 @@ mod tests {
         // dimensions the start point resolves to exactly (612, 792).
         let json = r#"{"lines": [{"x1": 0, "y1": 0, "x2": 0, "y2": 0, "x1_origin": "right", "y1_origin": "top"}]}"#;
         let config: StampConfig = serde_json::from_str(json).unwrap();
-        apply_stamp_config(&mut doc, &config);
+        apply_stamp_config(&mut doc, &config).expect("stamping should succeed");
 
         let page = match doc.get_object(page_id) {
             Ok(Object::Dictionary(ref d)) => d.clone(),
@@ -761,7 +807,7 @@ mod tests {
 
         let json = r#"{"text_blocks": [{"text": "aaaa bbbb cccc", "x": 50, "y": 700, "width": 70, "size": 10, "font": "Courier", "line_spacing": 14}]}"#;
         let config: StampConfig = serde_json::from_str(json).unwrap();
-        apply_stamp_config(&mut doc, &config);
+        apply_stamp_config(&mut doc, &config).expect("stamping should succeed");
 
         let contents = match doc.get_object(page_id) {
             Ok(Object::Dictionary(ref d)) => match d.get(b"Contents") {
@@ -847,7 +893,8 @@ mod tests {
         let catalog_id = doc.add_object(catalog);
         doc.trailer.set("Root", Object::Reference(catalog_id));
 
-        let font_name = ensure_font(&mut doc, page_id, "Helvetica");
+        let font_name = ensure_font(&mut doc, page_id, "Helvetica")
+            .expect("font registration should succeed");
         assert_eq!(font_name, "F_PS_Helvetica");
 
         // Verify font was added to page resources

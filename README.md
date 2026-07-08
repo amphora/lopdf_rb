@@ -123,7 +123,7 @@ doc.apply_visible_stamps({
 })
 ```
 
-Raises `ArgumentError` if the config hash cannot be deserialized.
+Raises `ArgumentError` if the config hash cannot be deserialized, and `RuntimeError` if a stamp cannot be applied (e.g. a font cannot be registered into a page's `/Resources`) — discard the document on error rather than saving it.
 
 ### `#save(path)` → `nil`
 
