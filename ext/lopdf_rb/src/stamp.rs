@@ -1701,6 +1701,137 @@ mod tests {
     }
 
     #[test]
+    fn test_stamp_emits_escaped_font_name_for_non_utf8_key() {
+        // End-to-end through the stamps loop: a Times-Roman entry keyed by
+        // the non-UTF8 bytes lopdf's parser decodes from /#cb#ce#cc#e5 is
+        // found and referenced byte-faithfully as /#CB#CE#CC#E5 in the Tf
+        // operator. Pre-fix the lossy key emitted U+FFFD bytes that matched
+        // no dictionary entry, so the stamp rendered blank.
+        let (mut doc, page_ids) = build_test_pdf(1, Some(us_letter_box()));
+        let page_id = page_ids[0];
+        let fonts_id =
+            add_indirect_font_dict(&mut doc, b"\xCB\xCE\xCC\xE5".as_slice(), "Times-Roman");
+        set_page_font(&mut doc, page_id, Object::Reference(fonts_id));
+
+        let json = r#"{"stamps": [{"text": "NonUtf8", "x": 50, "y": 50, "origin_x": "left", "origin_y": "bottom", "size": 12, "color": [0, 0, 0], "font": "Times-Roman"}]}"#;
+        let config: StampConfig = serde_json::from_str(json).unwrap();
+        apply_stamp_config(&mut doc, &config).expect("stamping should succeed");
+
+        let contents = match doc.get_object(page_id) {
+            Ok(Object::Dictionary(ref d)) => match d.get(b"Contents") {
+                Ok(Object::Array(ref a)) => a.clone(),
+                other => panic!("expected /Contents array after stamping, got {other:?}"),
+            },
+            other => panic!("expected page dictionary, got {other:?}"),
+        };
+        let stamp_ref = contents[1].as_reference().unwrap();
+        let content = match doc.get_object(stamp_ref) {
+            Ok(Object::Stream(ref s)) => String::from_utf8_lossy(&s.content).into_owned(),
+            other => panic!("expected stamp stream, got {other:?}"),
+        };
+        assert!(
+            content.contains("/#CB#CE#CC#E5 12 Tf"),
+            "the non-UTF8 key should be re-encoded byte-faithfully, got: {content}"
+        );
+        assert!(
+            content.contains("(NonUtf8) Tj"),
+            "stamp text should be in the content stream, got: {content}"
+        );
+        assert!(
+            !content.contains('\u{FFFD}'),
+            "no lossy replacement character may reach the output, got: {content}"
+        );
+    }
+
+    #[test]
+    fn test_stamp_emits_escaped_font_name_for_delimiter_key() {
+        // End-to-end through the text_blocks loop (the second emission
+        // site): a Courier entry keyed "F/1" — a delimiter that would have
+        // desynced the token stream as /F/1 — is emitted as /F#2F1.
+        let (mut doc, page_ids) = build_test_pdf(1, Some(us_letter_box()));
+        let page_id = page_ids[0];
+        let fonts_id = add_indirect_font_dict(&mut doc, b"F/1".as_slice(), "Courier");
+        set_page_font(&mut doc, page_id, Object::Reference(fonts_id));
+
+        let json = r#"{"text_blocks": [{"text": "Wrapped", "x": 50, "y": 700, "width": 200, "size": 10, "font": "Courier", "line_spacing": 14}]}"#;
+        let config: StampConfig = serde_json::from_str(json).unwrap();
+        apply_stamp_config(&mut doc, &config).expect("stamping should succeed");
+
+        let contents = match doc.get_object(page_id) {
+            Ok(Object::Dictionary(ref d)) => match d.get(b"Contents") {
+                Ok(Object::Array(ref a)) => a.clone(),
+                other => panic!("expected /Contents array after stamping, got {other:?}"),
+            },
+            other => panic!("expected page dictionary, got {other:?}"),
+        };
+        let stamp_ref = contents[1].as_reference().unwrap();
+        let content = match doc.get_object(stamp_ref) {
+            Ok(Object::Stream(ref s)) => String::from_utf8_lossy(&s.content).into_owned(),
+            other => panic!("expected stamp stream, got {other:?}"),
+        };
+        assert!(
+            content.contains("/F#2F1 10 Tf"),
+            "the delimiter in the key should be #XX-escaped, got: {content}"
+        );
+        assert!(
+            !content.contains("/F/1"),
+            "the raw delimiter form must never reach the output, got: {content}"
+        );
+    }
+
+    #[test]
+    fn test_stamped_name_round_trips_through_save_and_reload() {
+        // Pins that lopdf's writer (dictionary side) and encode_pdf_name
+        // (content-stream side) agree through a full serialization cycle:
+        // after save → reload, the /Font dictionary still holds the raw
+        // non-UTF8 key and the stamp stream still references its #XX form.
+        let (mut doc, page_ids) = build_test_pdf(1, Some(us_letter_box()));
+        let page_id = page_ids[0];
+        let fonts_id =
+            add_indirect_font_dict(&mut doc, b"\xCB\xCE\xCC\xE5".as_slice(), "Times-Roman");
+        set_page_font(&mut doc, page_id, Object::Reference(fonts_id));
+
+        let json = r#"{"stamps": [{"text": "RoundTrip", "x": 50, "y": 50, "origin_x": "left", "origin_y": "bottom", "size": 12, "color": [0, 0, 0], "font": "Times-Roman"}]}"#;
+        let config: StampConfig = serde_json::from_str(json).unwrap();
+        apply_stamp_config(&mut doc, &config).expect("stamping should succeed");
+
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).expect("saving should succeed");
+        let reloaded = Document::load_mem(&buf).expect("reloading should succeed");
+
+        let page_id = *reloaded.get_pages().values().next().expect("one page");
+        let resources = match reloaded.get_object(page_id) {
+            Ok(Object::Dictionary(ref d)) => match d.get(b"Resources") {
+                Ok(Object::Dictionary(ref r)) => r.clone(),
+                other => panic!("expected direct /Resources, got {other:?}"),
+            },
+            other => panic!("expected page dictionary, got {other:?}"),
+        };
+        assert_eq!(
+            find_font_in_resources(&reloaded, &resources, "Times-Roman").as_deref(),
+            Some(b"\xCB\xCE\xCC\xE5".as_slice()),
+            "the raw-byte key must survive the save/reload cycle"
+        );
+
+        let contents = match reloaded.get_object(page_id) {
+            Ok(Object::Dictionary(ref d)) => match d.get(b"Contents") {
+                Ok(Object::Array(ref a)) => a.clone(),
+                other => panic!("expected /Contents array, got {other:?}"),
+            },
+            other => panic!("expected page dictionary, got {other:?}"),
+        };
+        let stamp_ref = contents[1].as_reference().unwrap();
+        let content = match reloaded.get_object(stamp_ref) {
+            Ok(Object::Stream(ref s)) => String::from_utf8_lossy(&s.content).into_owned(),
+            other => panic!("expected stamp stream, got {other:?}"),
+        };
+        assert!(
+            content.contains("/#CB#CE#CC#E5 12 Tf"),
+            "the reloaded stamp stream must still reference the #XX form, got: {content}"
+        );
+    }
+
+    #[test]
     fn test_ensure_font_self_referential_font_ref_stays_reachable() {
         // Degenerate shape flagged in review: /Font referencing its own
         // containing object (here, the page itself). No guard is needed —
