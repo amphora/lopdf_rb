@@ -2,37 +2,63 @@ use lopdf::{Document, Object, ObjectId, Dictionary};
 use std::collections::{BTreeMap, HashSet};
 use std::io::Cursor;
 
-/// Rotate all pages in the document by the given angle (clockwise).
-///
-/// Angle must be 0, 90, 180, or 270. Rotation is cumulative — if a page
-/// already has `/Rotate 90` and you call `rotate_all_pages(doc, 180)`,
-/// the result is `/Rotate 270`.
-pub(crate) fn rotate_all_pages(doc: &mut Document, angle: i64) -> Result<(), String> {
+use crate::resolve::require_dict_mut;
+
+/// Validate a rotation angle for [`rotate_all_pages`]: must be 0, 90, 180,
+/// or 270. Also called by the FFI wrapper ahead of the core function, so
+/// an invalid angle can be mapped to `ArgumentError` while structural
+/// failures from the core call map to `RuntimeError` (the same split as
+/// `stamp_metadata` / `metadata::validate_field_lengths`).
+pub(crate) fn validate_rotation_angle(angle: i64) -> Result<(), String> {
     if ![0, 90, 180, 270].contains(&angle) {
         return Err(format!(
             "Invalid rotation angle {}. Must be 0, 90, 180, or 270.",
             angle
         ));
     }
+    Ok(())
+}
+
+/// Rotate all pages in the document by the given angle (clockwise).
+///
+/// Angle must be 0, 90, 180, or 270. Rotation is cumulative — if a page
+/// already has `/Rotate 90` and you call `rotate_all_pages(doc, 180)`,
+/// the result is `/Rotate 270`.
+///
+/// Errors on an invalid angle, and when a page id cannot be resolved to a
+/// mutable dictionary (defensive — lopdf's page iterator only yields
+/// dictionary-resolvable ids). On a mid-loop failure, pages already
+/// visited carry their new `/Rotate` in memory — discard the document on
+/// error rather than saving it.
+pub(crate) fn rotate_all_pages(doc: &mut Document, angle: i64) -> Result<(), String> {
+    validate_rotation_angle(angle)?;
 
     let page_ids: Vec<ObjectId> = doc.get_pages().values().copied().collect();
 
     for page_id in page_ids {
-        let existing = if let Ok(Object::Dictionary(ref page_dict)) = doc.get_object(page_id) {
-            match page_dict.get(b"Rotate") {
-                Ok(Object::Integer(r)) => *r,
-                _ => 0,
-            }
-        } else {
-            0
-        };
-
-        let new_angle = ((existing + angle) % 360 + 360) % 360;
-
-        if let Ok(Object::Dictionary(ref mut page_dict)) = doc.get_object_mut(page_id) {
-            page_dict.set("Rotate", Object::Integer(new_angle));
-        }
+        rotate_page(doc, page_id, angle)?;
     }
+
+    Ok(())
+}
+
+/// Add `angle` to a single page's `/Rotate` value, normalised into 0..360.
+/// A missing or non-integer `/Rotate` key reads as 0 and is overwritten
+/// with a direct integer; a page id that does not resolve to a dictionary
+/// is an error (the silent write guard this replaced skipped the page and
+/// reported success).
+fn rotate_page(doc: &mut Document, page_id: ObjectId, angle: i64) -> Result<(), String> {
+    let page_dict = require_dict_mut(doc, page_id, || {
+        format!("cannot set /Rotate on page object {:?}", page_id)
+    })?;
+
+    let existing = match page_dict.get(b"Rotate") {
+        Ok(Object::Integer(r)) => *r,
+        _ => 0,
+    };
+
+    let new_angle = ((existing + angle) % 360 + 360) % 360;
+    page_dict.set("Rotate", Object::Integer(new_angle));
 
     Ok(())
 }
@@ -306,6 +332,33 @@ mod tests {
         } else {
             panic!("Page object is not a dictionary");
         }
+    }
+
+    #[test]
+    fn test_rotate_page_errors_on_dangling_page_object() {
+        // Unreachable through rotate_all_pages (get_pages only yields
+        // dictionary-resolvable ids) — call the helper directly to pin
+        // the Err contract, as metadata.rs's error-path tests do.
+        let mut doc = create_test_pdf(1);
+        let err = rotate_page(&mut doc, (9999, 0), 90)
+            .expect_err("a dangling page id must fail the /Rotate write");
+        assert!(
+            err.contains("cannot set /Rotate"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rotate_page_errors_on_non_dictionary_page_object() {
+        // The ok-but-not-a-Dictionary shape (as_dict_mut failure).
+        let mut doc = create_test_pdf(1);
+        let int_id = doc.add_object(Object::Integer(7));
+        let err = rotate_page(&mut doc, int_id, 90)
+            .expect_err("a non-dictionary page object must fail the /Rotate write");
+        assert!(
+            err.contains("cannot set /Rotate"),
+            "unexpected error message: {err}"
+        );
     }
 
     // ── Split tests ─────────────────────────────────────────────────────
