@@ -149,6 +149,30 @@ doc.rotate_all_pages(90)
 
 Raises `ArgumentError` if the angle is not one of 0/90/180/270. Raises `RuntimeError` if a page dictionary cannot be resolved for the write — the document may be partially rotated in memory at that point, so discard it on error rather than saving it.
 
+### `#split_pages` → `Array<Document>`
+
+Split the document into single-page documents — one new `LopdfRb::Document` per page, in page order. The source document is not modified.
+
+Each output is built by cloning the full source, deleting every other page, and pruning unreferenced objects. Only one extra clone exists at a time, so peak memory is ~2x the source document.
+
+```ruby
+pages = doc.split_pages
+pages.each_with_index { |page, i| page.save("page-#{i + 1}.pdf") }
+```
+
+Raises `RuntimeError` if the document has no pages.
+
+### `#duplicate` → `Document`
+
+Deep-copy the document via an in-memory serialize round-trip (save + reload), returning a fully independent copy — changes to either document never affect the other. The round-trip normalises the copy's cross-reference tables, so the result is a guaranteed-valid standalone document.
+
+```ruby
+copy = doc.duplicate
+copy.rotate_all_pages(90)   # the original is unaffected
+```
+
+Raises `RuntimeError` if the document cannot be serialized or the serialized bytes cannot be reloaded.
+
 ### `#save(path)` → `nil`
 
 Save the document to a file. Raises `RuntimeError` on I/O failure.
