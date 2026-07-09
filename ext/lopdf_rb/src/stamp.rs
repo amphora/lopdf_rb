@@ -3,6 +3,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::geometry::{get_page_dimensions_or_fallback, resolve_x, resolve_y};
 use crate::metrics::text_width_pt;
+use crate::resolve::{require_dict, require_dict_mut};
 
 /// Stamp configuration read from the JSON file produced by Ruby.
 #[derive(Deserialize)]
@@ -346,35 +347,6 @@ fn wrap_text(text: &str, base_font: &str, font_size: f64, max_width: f64) -> Vec
     }
 
     lines
-}
-
-/// Resolve an object id to its mutable dictionary for a content-stream
-/// write, failing with `"<action>: <lopdf error>"`. Covers both failure
-/// shapes the old silent `if let Ok(Object::Dictionary(...))` guards
-/// swallowed: `get_object_mut` errors and ok-but-not-a-Dictionary objects.
-/// The action closure is only evaluated on the error path.
-fn require_dict_mut(
-    doc: &mut Document,
-    id: ObjectId,
-    action: impl FnOnce() -> String,
-) -> Result<&mut Dictionary, String> {
-    doc.get_object_mut(id)
-        .and_then(Object::as_dict_mut)
-        .map_err(|e| format!("{}: {}", action(), e))
-}
-
-/// Immutable sibling of [`require_dict_mut`]: resolve an object id to its
-/// dictionary for a read the caller's contract requires to succeed,
-/// failing with `"<action>: <lopdf error>"`. The action closure is only
-/// evaluated on the error path.
-fn require_dict(
-    doc: &Document,
-    id: ObjectId,
-    action: impl FnOnce() -> String,
-) -> Result<&Dictionary, String> {
-    doc.get_object(id)
-        .and_then(Object::as_dict)
-        .map_err(|e| format!("{}: {}", action(), e))
 }
 
 /// Escape special characters for a PDF text string (parenthesised literal).
