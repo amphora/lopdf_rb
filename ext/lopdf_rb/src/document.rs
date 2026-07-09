@@ -343,6 +343,11 @@ impl RbDocument {
     /// Takes a Ruby Array of `LopdfRb::Document` instances. Returns a new
     /// merged document with all pages in order.
     ///
+    /// Raises `ArgumentError` when an element of the array is not a
+    /// `LopdfRb::Document`, and `RuntimeError` when the merge fails (an
+    /// empty input list, or a merged page whose dictionary cannot be
+    /// resolved for the /Parent rewrite). The inputs are never modified.
+    ///
     /// Uses manual iteration with `TryConvert` because `Obj<T>` does not
     /// implement `TryConvertOwned` (required by `RArray::to_vec`).
     fn merge(docs: RArray) -> Result<Self, Error> {

@@ -112,6 +112,12 @@ pub(crate) fn duplicate_document(doc: &mut Document) -> Result<Document, String>
 /// Follows lopdf's merge.rs example: renumber objects from each input to avoid
 /// ID collisions, collect all pages into a single /Pages tree, build a new
 /// catalog. Skips bookmark handling (PatentSafe doesn't use PDF bookmarks).
+///
+/// Errors on an empty input list, and when a merged page id cannot be
+/// resolved to a mutable dictionary for the /Parent rewrite (defensive —
+/// each page object is inserted into the merged document just before the
+/// rewrite). On error the partially built document is dropped; the inputs
+/// are never modified.
 pub(crate) fn merge_documents(docs: &[&Document]) -> Result<Document, String> {
     if docs.is_empty() {
         return Err("Cannot merge an empty list of documents".to_string());
@@ -162,8 +168,10 @@ pub(crate) fn merge_documents(docs: &[&Document]) -> Result<Document, String> {
 
     // Insert page objects
     let mut kids: Vec<Object> = Vec::new();
+    let mut merged_page_ids: Vec<ObjectId> = Vec::new();
     for (page_id, page_obj) in all_page_objects {
         kids.push(Object::Reference(page_id));
+        merged_page_ids.push(page_id);
         merged.objects.insert(page_id, page_obj);
     }
 
@@ -181,18 +189,14 @@ pub(crate) fn merge_documents(docs: &[&Document]) -> Result<Document, String> {
     let pages_root_id = merged.new_object_id();
 
     // Update each page's /Parent to point to the new Pages root
-    for kid in &kids {
-        if let Object::Reference(page_id) = kid {
-            if let Ok(Object::Dictionary(ref mut page_dict)) = merged.get_object_mut(*page_id) {
-                page_dict.set("Parent", Object::Reference(pages_root_id));
-            }
-        }
+    for page_id in merged_page_ids {
+        set_page_parent(&mut merged, page_id, pages_root_id)?;
     }
 
     let mut pages_dict = Dictionary::new();
     pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
-    pages_dict.set("Kids", Object::Array(kids.clone()));
     pages_dict.set("Count", Object::Integer(kids.len() as i64));
+    pages_dict.set("Kids", Object::Array(kids));
     merged
         .objects
         .insert(pages_root_id, Object::Dictionary(pages_dict));
@@ -213,6 +217,22 @@ pub(crate) fn merge_documents(docs: &[&Document]) -> Result<Document, String> {
     merged.max_id = merged.objects.keys().map(|&(id, _)| id).max().unwrap_or(0);
 
     Ok(merged)
+}
+
+/// Point a merged page's `/Parent` at the new `/Pages` root. A page id
+/// that does not resolve to a dictionary is an error (the silent write
+/// guard this replaced skipped the page and reported success, leaving its
+/// `/Parent` aimed at a dropped node).
+fn set_page_parent(
+    doc: &mut Document,
+    page_id: ObjectId,
+    parent_id: ObjectId,
+) -> Result<(), String> {
+    let page_dict = require_dict_mut(doc, page_id, || {
+        format!("cannot rewrite /Parent on merged page object {:?}", page_id)
+    })?;
+    page_dict.set("Parent", Object::Reference(parent_id));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -568,6 +588,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_merge_rewrites_parent_to_new_pages_root() {
+        // No other merge test asserts /Parent — page-tree traversal never
+        // consults it — so a regression that skipped the rewrite entirely
+        // would pass the rest of the suite while emitting pages whose
+        // /Parent aims at a dropped node.
+        let doc1 = create_test_pdf(2);
+        let doc2 = create_test_pdf(1);
+        let merged = merge_documents(&[&doc1, &doc2]).unwrap();
+
+        let catalog_id = merged.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let pages_root = match merged.get_object(catalog_id) {
+            Ok(Object::Dictionary(catalog)) => {
+                catalog.get(b"Pages").unwrap().as_reference().unwrap()
+            }
+            other => panic!("catalog is not a dictionary: {other:?}"),
+        };
+
+        for (_page_num, page_id) in merged.get_pages() {
+            match merged.get_object(page_id) {
+                Ok(Object::Dictionary(page_dict)) => assert_eq!(
+                    page_dict.get(b"Parent").unwrap(),
+                    &Object::Reference(pages_root),
+                    "page {page_id:?} /Parent should point at the new /Pages root"
+                ),
+                other => panic!("page {page_id:?} is not a dictionary: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_set_page_parent_errors_on_dangling_page_object() {
+        // Unreachable through merge_documents (each page object is
+        // inserted into the merged document just before its /Parent is
+        // rewritten) — direct call, as metadata.rs's error-path tests do.
+        let mut doc = create_test_pdf(1);
+        let parent_id = doc.new_object_id();
+        let err = set_page_parent(&mut doc, (9999, 0), parent_id)
+            .expect_err("a dangling page id must fail the /Parent rewrite");
+        assert!(
+            err.contains("cannot rewrite /Parent"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_set_page_parent_errors_on_non_dictionary_page_object() {
+        // The ok-but-not-a-Dictionary shape (as_dict_mut failure).
+        let mut doc = create_test_pdf(1);
+        let int_id = doc.add_object(Object::Integer(7));
+        let parent_id = doc.new_object_id();
+        let err = set_page_parent(&mut doc, int_id, parent_id)
+            .expect_err("a non-dictionary page object must fail the /Parent rewrite");
+        assert!(
+            err.contains("cannot rewrite /Parent"),
+            "unexpected error message: {err}"
+        );
     }
 
     // ── Duplicate tests ─────────────────────────────────────────────────
