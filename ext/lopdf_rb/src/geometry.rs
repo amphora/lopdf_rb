@@ -291,8 +291,8 @@ mod tests {
     fn test_obj_to_f64_integer_and_real() {
         let doc = Document::new();
         assert_eq!(obj_to_f64(&doc, &Object::Integer(42)), Some(42.0));
-        let real = obj_to_f64(&doc, &Object::Real(3.14)).unwrap();
-        assert!((real - 3.14).abs() < 0.001);
+        let real = obj_to_f64(&doc, &Object::Real(2.5)).unwrap();
+        assert!((real - 2.5).abs() < 0.001);
     }
 
     #[test]
