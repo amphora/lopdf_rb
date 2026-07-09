@@ -189,11 +189,12 @@ Requires Rust (stable) and the `rb_sys` gem:
 cd gems/lopdf_rb
 cargo build --release    # compile the native extension
 cargo test               # run Rust unit tests
-cargo clippy             # lint
+cargo clippy --workspace --all-targets -- -D warnings   # lint (same invocation CI enforces)
 ```
 
-CI (`.github/workflows/ci.yml`) runs `cargo test --workspace` on every
-pull request and push to `main`.
+CI (`.github/workflows/ci.yml`) runs
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo test --workspace` on every pull request and push to `main`.
 
 ## License
 
