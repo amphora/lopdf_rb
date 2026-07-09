@@ -215,8 +215,9 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) -> Re
 
         for item in &config.stamps {
             let base_font = resolve_base_font(&item.font);
-            let font_name = ensure_font(doc, page_id, base_font)
+            let font_key = ensure_font(doc, page_id, base_font)
                 .map_err(|e| format!("page {page_number}: {e}"))?;
+            let font_name = encode_pdf_name(&font_key);
 
             let mut abs_x = resolve_x(item.x, &item.origin_x, page_width);
             let mut abs_y = resolve_y(item.y, &item.origin_y, page_height);
@@ -262,8 +263,9 @@ pub(crate) fn apply_stamp_config(doc: &mut Document, config: &StampConfig) -> Re
         // Render text blocks (word-wrapped)
         for block in &config.text_blocks {
             let base_font = resolve_base_font(&block.font);
-            let font_name = ensure_font(doc, page_id, base_font)
+            let font_key = ensure_font(doc, page_id, base_font)
                 .map_err(|e| format!("page {page_number}: {e}"))?;
+            let font_name = encode_pdf_name(&font_key);
 
             let abs_x = resolve_x(block.x, &block.origin_x, page_width);
             let abs_y = resolve_y(block.y, &block.origin_y, page_height);
@@ -384,6 +386,29 @@ fn escape_pdf_text(text: &str) -> String {
         .replace('\r', "\\r")
 }
 
+/// Encode raw PDF-name bytes for emission into a generated content stream
+/// (the `/Name` after the solidus), applying the `#XX` escaping of
+/// ISO 32000 §7.3.5. Mirrors lopdf 0.34's `Writer::write_name` (writer.rs)
+/// byte-for-byte — same escape set, same uppercase hex — so the name
+/// emitted here and the /Font dictionary key lopdf serializes at save time
+/// are textually identical and decode to the same byte sequence. Regular
+/// bytes (printable ASCII minus delimiters and `#`) pass through, so the
+/// generated `F_PS_*` names are unchanged by construction. Re-check the
+/// mirrored rule if the lopdf pin is ever bumped.
+fn encode_pdf_name(name: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(name.len());
+    for &byte in name {
+        if b" \t\n\r\x0C()<>[]{}/%#".contains(&byte) || !(0x21..=0x7E).contains(&byte) {
+            // Infallible for String; matches lopdf's `write!(file, "#{:02X}", byte)`.
+            let _ = write!(out, "#{byte:02X}");
+        } else {
+            out.push(byte as char);
+        }
+    }
+    out
+}
+
 /// Append a content stream to a page's /Contents, preserving existing content.
 ///
 /// /Contents can be a Reference (to a Stream or Array), a direct Array,
@@ -471,8 +496,11 @@ fn resolve_base_font(font: &Option<String>) -> &str {
 }
 
 /// Ensure the requested base font exists in the page's /Resources, walking
-/// the /Parent chain for inherited Resources. Returns the font's resource name
-/// (e.g. "F_PS_Helvetica") for use in content stream Tf operators.
+/// the /Parent chain for inherited Resources. Returns the font's resource
+/// key (e.g. `F_PS_Helvetica`) as raw bytes — an existing key found by
+/// lookup may contain non-UTF8 bytes or delimiters (see
+/// `find_base_font_in`), so callers must encode it via `encode_pdf_name`
+/// before interpolating it into a content stream Tf operator.
 ///
 /// /Font inside Resources may be a direct Dictionary or an indirect
 /// Reference (ISO 32000 §7.8.3) — lookups dereference it, and registration
@@ -492,7 +520,7 @@ fn resolve_base_font(font: &Option<String>) -> &str {
 /// the freshly created font object has already been added to the document
 /// but is wired into no /Resources — an orphan, harmless because callers
 /// discard the document on error (see `apply_stamp_config`).
-fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> Result<String, String> {
+fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> Result<Vec<u8>, String> {
     // Phase 1: Walk /Parent chain to find /Resources (inheritable per ISO 32000).
     // Snapshot the location so we can mutate afterwards without borrow conflicts.
     enum ResourcesLocation {
@@ -503,7 +531,7 @@ fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> Result
     }
 
     let mut location = ResourcesLocation::Missing;
-    let mut existing_name: Option<String> = None;
+    let mut existing_name: Option<Vec<u8>> = None;
 
     let mut current_id = page_id;
     let mut is_leaf = true;
@@ -621,7 +649,7 @@ fn ensure_font(doc: &mut Document, page_id: ObjectId, base_font: &str) -> Result
         }
     }
 
-    Ok(font_name)
+    Ok(font_name.into_bytes())
 }
 
 /// Complete a font registration whose /Font entry is an indirect reference:
@@ -648,7 +676,7 @@ fn write_font_through_ref(
 /// direct Dictionary or an indirect Reference (ISO 32000 §7.8.3 permits both).
 /// An unresolvable Reference yields None — "not found" is the right answer
 /// for a lookup; the registration path reports the broken reference as `Err`.
-fn find_font_in_resources(doc: &Document, resources: &Dictionary, base_font: &str) -> Option<String> {
+fn find_font_in_resources(doc: &Document, resources: &Dictionary, base_font: &str) -> Option<Vec<u8>> {
     match resources.get(b"Font") {
         Ok(Object::Dictionary(ref fonts)) => find_base_font_in(doc, fonts, base_font),
         Ok(Object::Reference(ref_id)) => {
@@ -668,7 +696,13 @@ fn find_font_in_resources(doc: &Document, resources: &Dictionary, base_font: &st
 /// dictionary is skipped — "not found" is the right answer for a lookup,
 /// and this function never becomes a write target (unlike the /Resources
 /// and /Font container references, whose registration paths error).
-fn find_base_font_in(doc: &Document, fonts: &Dictionary, base_font: &str) -> Option<String> {
+///
+/// The matched key is returned as its raw bytes: a legal name key may
+/// decode (via `#XX` escapes) to bytes that are not UTF-8 or that contain
+/// delimiters, and a lossy conversion would destroy exactly the bytes an
+/// emission site needs to reference the entry — encoding happens only at
+/// emission, via `encode_pdf_name`.
+fn find_base_font_in(doc: &Document, fonts: &Dictionary, base_font: &str) -> Option<Vec<u8>> {
     let target = base_font.as_bytes();
     for (name, entry) in fonts.iter() {
         let font_dict = match entry {
@@ -681,7 +715,7 @@ fn find_base_font_in(doc: &Document, fonts: &Dictionary, base_font: &str) -> Opt
         };
         if let Ok(Object::Name(ref bf)) = font_dict.get(b"BaseFont") {
             if bf == target {
-                return Some(String::from_utf8_lossy(name).to_string());
+                return Some(name.clone());
             }
         }
     }
@@ -776,8 +810,10 @@ mod tests {
 
     /// Add an indirect /Font dictionary object holding `key` → a Type1
     /// `base_font`; returns the /Font dictionary's object id, for pages to
-    /// reference from /Resources in the indirect-/Font tests.
-    fn add_indirect_font_dict(doc: &mut Document, key: &str, base_font: &str) -> ObjectId {
+    /// reference from /Resources in the indirect-/Font tests. The key is
+    /// generic over `Into<Vec<u8>>` so the name-encoding tests can register
+    /// non-UTF8 or delimiter-carrying keys; `&str` call sites are unchanged.
+    fn add_indirect_font_dict(doc: &mut Document, key: impl Into<Vec<u8>>, base_font: &str) -> ObjectId {
         let font_obj_id = add_type1_font(doc, base_font);
         let mut fonts = Dictionary::new();
         fonts.set(key, Object::Reference(font_obj_id));
@@ -828,6 +864,29 @@ mod tests {
         assert_eq!(escape_pdf_text(r"a\b"), r"a\\b");
         assert_eq!(escape_pdf_text("a(b)c"), r"a\(b\)c");
         assert_eq!(escape_pdf_text("line1\nline2"), r"line1\nline2");
+    }
+
+    #[test]
+    fn encode_pdf_name_passes_regular_names_unchanged() {
+        // The generated F_PS_* names are all regular bytes, so uniform
+        // encoding at emission is a no-op for them by construction.
+        assert_eq!(encode_pdf_name(b"F_PS_Helvetica"), "F_PS_Helvetica");
+        assert_eq!(encode_pdf_name(b"TR7"), "TR7");
+    }
+
+    #[test]
+    fn encode_pdf_name_escapes_delimiters_whitespace_hash_and_non_regular_bytes() {
+        assert_eq!(encode_pdf_name(b"F 1"), "F#201");
+        assert_eq!(encode_pdf_name(b"F/1"), "F#2F1");
+        assert_eq!(encode_pdf_name(b"F#1"), "F#231");
+        assert_eq!(encode_pdf_name(b"a(b)"), "a#28b#29");
+        // The non-UTF8 bytes lopdf's own parser test decodes from /#cb#ce#cc#e5.
+        assert_eq!(encode_pdf_name(b"\xCB\xCE\xCC\xE5"), "#CB#CE#CC#E5");
+        // ISO 32000 §7.3.5 forbids #00 in a conforming name, but lopdf's
+        // writer emits it for a nonconforming key — matching that keeps the
+        // dictionary key and the content-stream name agreed either way.
+        assert_eq!(encode_pdf_name(b"\x00"), "#00");
+        assert_eq!(encode_pdf_name(b""), "");
     }
 
     #[test]
@@ -1104,7 +1163,7 @@ mod tests {
 
         let font_name = ensure_font(&mut doc, page_id, "Helvetica")
             .expect("font registration should succeed");
-        assert_eq!(font_name, "F_PS_Helvetica");
+        assert_eq!(font_name, b"F_PS_Helvetica");
 
         // Verify font was added to page resources
         if let Ok(Object::Dictionary(ref page_dict)) = doc.get_object(page_id) {
@@ -1165,7 +1224,7 @@ mod tests {
         let font_name = ensure_font(&mut doc, page_id, "Times-Roman")
             .expect("lookup through an indirect /Font reference should succeed");
 
-        assert_eq!(font_name, "F1", "existing font should be found through the reference");
+        assert_eq!(font_name, b"F1", "existing font should be found through the reference");
         assert_eq!(
             doc.objects.len(),
             object_count,
@@ -1193,7 +1252,7 @@ mod tests {
         let font_name = ensure_font(&mut doc, page_id, "Times-Roman")
             .expect("lookup of a direct-dict font entry should succeed");
 
-        assert_eq!(font_name, "TR7", "existing direct-dict entry should be reused");
+        assert_eq!(font_name, b"TR7", "existing direct-dict entry should be reused");
         assert_eq!(
             doc.objects.len(),
             object_count,
@@ -1208,6 +1267,31 @@ mod tests {
     }
 
     #[test]
+    fn test_ensure_font_returns_raw_bytes_for_non_utf8_key() {
+        // A legal /Font key may decode (via #XX escapes) to non-UTF8 bytes —
+        // lopdf's parser test pins /#cb#ce#cc#e5 → these bytes. Pre-fix,
+        // from_utf8_lossy replaced them with U+FFFD, so the emitted Tf name
+        // no longer byte-matched the dictionary key and the stamp rendered
+        // blank in a conforming viewer.
+        let (mut doc, page_ids) = build_test_pdf(1, Some(us_letter_box()));
+        let page_id = page_ids[0];
+        let key: &[u8] = b"\xCB\xCE\xCC\xE5";
+        let fonts_id = add_indirect_font_dict(&mut doc, key, "Times-Roman");
+        set_page_font(&mut doc, page_id, Object::Reference(fonts_id));
+        let object_count = doc.objects.len();
+
+        let font_key = ensure_font(&mut doc, page_id, "Times-Roman")
+            .expect("lookup of a non-UTF8 key should succeed");
+
+        assert_eq!(font_key, key, "the matched key must be returned byte-faithfully");
+        assert_eq!(
+            doc.objects.len(),
+            object_count,
+            "a lookup hit should not add objects or re-register the font"
+        );
+    }
+
+    #[test]
     fn test_ensure_font_registers_through_indirect_font_ref() {
         let (mut doc, page_ids) = build_test_pdf(1, Some(us_letter_box()));
         let page_id = page_ids[0];
@@ -1216,7 +1300,7 @@ mod tests {
 
         let font_name = ensure_font(&mut doc, page_id, "Courier")
             .expect("registration through an indirect /Font reference should succeed");
-        assert_eq!(font_name, "F_PS_Courier");
+        assert_eq!(font_name, b"F_PS_Courier");
 
         // The write went through the reference: the referenced dict holds the
         // original and the new entry, both resolving to their BaseFonts.
@@ -1264,7 +1348,7 @@ mod tests {
 
         let font_name = ensure_font(&mut doc, page_id, "Courier")
             .expect("registration through indirect /Resources and /Font should succeed");
-        assert_eq!(font_name, "F_PS_Courier");
+        assert_eq!(font_name, b"F_PS_Courier");
 
         let fonts = match doc.get_object(fonts_id) {
             Ok(Object::Dictionary(ref fonts)) => fonts.clone(),
@@ -1307,7 +1391,7 @@ mod tests {
 
         let font_name = ensure_font(&mut doc, page_id, "Courier")
             .expect("registration against inherited resources should succeed");
-        assert_eq!(font_name, "F_PS_Courier");
+        assert_eq!(font_name, b"F_PS_Courier");
 
         // The page gained its own /Resources whose /Font was promoted to a
         // direct dict holding the inherited font plus the new one.
@@ -1521,7 +1605,7 @@ mod tests {
 
         let font_name = ensure_font(&mut doc, page_id, "Courier")
             .expect("a malformed direct /Font value should be repaired");
-        assert_eq!(font_name, "F_PS_Courier");
+        assert_eq!(font_name, b"F_PS_Courier");
 
         let fonts = page_font_dict(&doc, page_id);
         assert!(
@@ -1544,7 +1628,7 @@ mod tests {
 
         let font_name = ensure_font(&mut doc, page_id, "Courier")
             .expect("registration into a direct /Font dict should succeed");
-        assert_eq!(font_name, "F_PS_Courier");
+        assert_eq!(font_name, b"F_PS_Courier");
 
         let fonts = page_font_dict(&doc, page_id);
         assert!(
@@ -1629,7 +1713,7 @@ mod tests {
 
         let font_name = ensure_font(&mut doc, page_id, "Courier")
             .expect("a self-referential /Font should still register");
-        assert_eq!(font_name, "F_PS_Courier");
+        assert_eq!(font_name, b"F_PS_Courier");
 
         // Reachability the way a viewer resolves it: page /Resources ->
         // /Font (a reference back at the page) -> entry present.
