@@ -299,9 +299,16 @@ impl RbDocument {
     ///
     /// Angle must be 0, 90, 180, or 270 (clockwise). Cumulative with any
     /// existing `/Rotate` value on each page.
+    ///
+    /// Raises `ArgumentError` when the angle is not one of 0/90/180/270,
+    /// and `RuntimeError` when a page dictionary cannot be resolved for
+    /// the write — the document may be partially rotated in memory at
+    /// that point and must be discarded, not saved.
     fn rotate_all_pages(&self, angle: i64) -> Result<(), Error> {
+        crate::manipulation::validate_rotation_angle(angle)
+            .map_err(|e| Error::new(magnus::exception::arg_error(), e))?;
         crate::manipulation::rotate_all_pages(&mut self.inner.borrow_mut(), angle)
-            .map_err(|e| Error::new(magnus::exception::arg_error(), e))
+            .map_err(|e| Error::new(magnus::exception::runtime_error(), e))
     }
 
     /// `doc.split_pages` — split into individual single-page documents.
@@ -335,6 +342,11 @@ impl RbDocument {
     ///
     /// Takes a Ruby Array of `LopdfRb::Document` instances. Returns a new
     /// merged document with all pages in order.
+    ///
+    /// Raises `ArgumentError` when an element of the array is not a
+    /// `LopdfRb::Document`, and `RuntimeError` when the merge fails (an
+    /// empty input list, or a merged page whose dictionary cannot be
+    /// resolved for the /Parent rewrite). The inputs are never modified.
     ///
     /// Uses manual iteration with `TryConvert` because `Obj<T>` does not
     /// implement `TryConvertOwned` (required by `RArray::to_vec`).

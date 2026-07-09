@@ -34,6 +34,16 @@ Load a PDF from a file path. Raises `RuntimeError` if the file cannot be read or
 
 Load a PDF from a binary string (`String` with `ASCII-8BIT` encoding). Raises `RuntimeError` if the data is not valid PDF.
 
+### `LopdfRb::Document.merge(docs)` → `Document`
+
+Merge an array of `LopdfRb::Document` instances into a single new document, with all pages in input order. The input documents are never modified.
+
+```ruby
+merged = LopdfRb::Document.merge([doc1, doc2, doc3])
+```
+
+Raises `ArgumentError` if an element of the array is not a `LopdfRb::Document`. Raises `RuntimeError` if the merge fails — an empty input list, or a merged page whose dictionary cannot be resolved when its `/Parent` is rewritten to the new page tree.
+
 ### `#page_count` → `Integer`
 
 Returns the number of pages in the document.
@@ -128,6 +138,16 @@ Raises `ArgumentError` if the config hash cannot be deserialized, and `RuntimeEr
 `/Font` inside a page's `/Resources` is handled as either a direct dictionary or an indirect reference (both legal per ISO 32000 §7.8.3), and entries inside it are found whether stored as references or direct dictionaries; a `/Font` reference that does not resolve to a dictionary raises rather than silently leaving the stamp text unrendered. A `/Resources` entry that is an unresolvable indirect reference — on the page itself or on a `/Parent` ancestor consulted for inheritance — also raises, rather than being silently replaced or skipped over. Fonts registered on a page with inherited (parent-level) resources never mutate the shared parent dictionaries — the page gets its own resources copy. Resource names referenced in generated content streams are `#XX`-encoded per ISO 32000 §7.3.5, so an existing font entry whose key contains delimiters, `#`, or non-ASCII bytes is reused and referenced byte-faithfully rather than emitted corrupted.
 
 Colour channels outside 0.0–1.0 are clamped into range (DeviceRGB operands must be in [0.0, 1.0] per the PDF spec).
+
+### `#rotate_all_pages(angle)` → `nil`
+
+Rotate every page of the document by the given angle (clockwise). The angle must be 0, 90, 180, or 270, and is cumulative with any existing `/Rotate` value on a page — rotating a page that already carries `/Rotate 90` by 180 yields `/Rotate 270`.
+
+```ruby
+doc.rotate_all_pages(90)
+```
+
+Raises `ArgumentError` if the angle is not one of 0/90/180/270. Raises `RuntimeError` if a page dictionary cannot be resolved for the write — the document may be partially rotated in memory at that point, so discard it on error rather than saving it.
 
 ### `#save(path)` → `nil`
 
